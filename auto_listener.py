@@ -156,13 +156,21 @@ async def _send_message(client: Client, message: Message, target: int):
         logger.error(f"Affiliate forward to {target} failed: {e}")
 
 
-async def _affiliate_process(client: Client, original: Message, bot_username: str) -> Message | None:
+async def _affiliate_process(client: Client, original: Message, bot_id) -> Message | None:
     """
-    ✅ FIX: Channel messages ko directly forward nahi kar sakte private bot pe.
-    Solution: Message ka text/caption seedha send karo. Media ho toh copy_message.
+    ✅ FIX: bot_id ab integer hai (username nahi).
+    Channel messages ko directly forward nahi kar sakte private bot pe.
+    Solution: Message ka text/caption seedha send karo.
     """
-    bot_chat = await client.get_chat(bot_username)
-    bot_id   = bot_chat.id
+    # bot_id integer ya string dono handle karo (backward compat)
+    if isinstance(bot_id, str):
+        try:
+            bot_chat = await client.get_chat(bot_id)
+            bot_id   = bot_chat.id
+        except Exception as e:
+            logger.error(f"Affiliate bot resolve failed: {e}")
+            return None
+
     replied  = asyncio.get_event_loop().create_future()
 
     async def _wait_reply(_: Client, msg: Message):
