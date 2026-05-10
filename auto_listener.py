@@ -4,9 +4,8 @@ Auto-Listener:
 - Naya message aaya → text process karo → targets pe forward karo
 - Affiliate bot option: pehle bot ko message bhejo, reply aaye toh forward karo
 
-Bot start hone pe:  start_listeners() call karo
-Naya rule add hone pe: register_rule() call karo
-Rule delete hone pe:   unregister_rule() call karo
+FIX: Affiliate bot flow - channel se forward_messages bot pe kaam nahi karta.
+     Ab text/caption seedha send hoga bot ko.
 """
 import asyncio
 import logging
@@ -22,28 +21,18 @@ from utils import process_text
 
 logger = logging.getLogger(__name__)
 
-# { rule_id: handler_object }  — taaki delete pe remove kar sakein
 _handlers: dict[str, MessageHandler] = {}
-
-# { rule_id: rule_dict }
 _rule_map: dict[str, dict] = {}
-
-# { source_id: [rule_id, ...] }  — ek source pe multiple rules ho sakte hain
 _source_map: dict[int, list[str]] = {}
 
 
-# ───────────────────────────── STARTUP ──────────────────────────────────
-
 async def start_listeners():
-    """Bot start hone pe DB se saare rules load karo aur listeners attach karo."""
     all_rules = await db.get_all_rules()
     for rule in all_rules:
         owner_id = rule["owner_id"]
         await register_rule(owner_id, rule, _startup=True)
     logger.info(f"Auto-listeners started for {len(all_rules)} rules.")
 
-
-# ─────────────────────────── REGISTER ────────────────────────────────────
 
 async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
     rule_id   = rule["rule_id"]
@@ -56,8 +45,6 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
     if rule_id not in _source_map[source_id]:
         _source_map[source_id].append(rule_id)
 
-    # Agar is source ke liye handler already hai toh naya mat banao
-    # Ek generic handler jo source_id se route karega
     handler_key = f"src_{source_id}"
     if handler_key not in _handlers:
         async def _make_handler(src_id: int):
@@ -67,11 +54,10 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
                 await _on_new_message(client, message, src_id)
             return handler
 
-        fn      = await _make_handler(source_id)
-        h       = MessageHandler(fn, filters=channel)
+        fn = await _make_handler(source_id)
+        h  = MessageHandler(fn, filters=channel)
         _handlers[handler_key] = h
 
-        # Attach to all userbots whose rules reference this source
         for oid, client in _clients.items():
             client.add_handler(h)
 
@@ -88,7 +74,6 @@ def unregister_rule(rule_id: str):
     if rule_id in lst:
         lst.remove(rule_id)
 
-    # Agar is source pe aur koi rule nahi toh handler bhi hata do
     if not lst:
         handler_key = f"src_{source_id}"
         h = _handlers.pop(handler_key, None)
@@ -98,8 +83,6 @@ def unregister_rule(rule_id: str):
 
     logger.info(f"Rule {rule_id} unregistered")
 
-
-# ───────────────────────── NEW MESSAGE EVENT ─────────────────────────────
 
 async def _on_new_message(client: Client, message: Message, source_id: int):
     rule_ids = _source_map.get(source_id, [])
@@ -111,12 +94,11 @@ async def _on_new_message(client: Client, message: Message, source_id: int):
 
 
 async def _process_and_forward(client: Client, message: Message, rule: dict):
-    owner_id      = rule["owner_id"]
-    targets       = rule["targets"]
-    affiliate_bot = rule.get("affiliate_bot")
-    hide_links    = rule.get("hide_links", False)
-    hide_usernames= rule.get("hide_usernames", False)
-    replace_map   = rule.get("replace_map", {})
+    targets        = rule["targets"]
+    affiliate_bot  = rule.get("affiliate_bot")
+    hide_links     = rule.get("hide_links", False)
+    hide_usernames = rule.get("hide_usernames", False)
+    replace_map    = rule.get("replace_map", {})
 
     # ── Affiliate bot flow ───────────────────────────────────
     if affiliate_bot:
@@ -127,13 +109,12 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
             processed = None
 
         if processed:
-            # processed is a Message from affiliate bot
             for target in targets:
                 await _send_message(client, processed, target)
             return
-        # fallback: normal forward agar affiliate bot ne kuch nahi diya
+        # fallback: normal forward
 
-    # ── Normal forward with text processing ─────────────────
+    # ── Normal forward ───────────────────────────────────────
     raw_text = message.text or message.caption or ""
     new_text = process_text(
         raw_text,
@@ -148,18 +129,13 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
 
 
 async def _forward_one(client: Client, message: Message, target: int, new_text: str):
-    """Message ko ek target pe bhejo — text modified, media preserved."""
     try:
         if message.media:
-            # Media message — copy with new caption
             await client.copy_message(
-                chat_id     = target,
-                from_chat_id= message.chat.id,
-                message_id  = message.id,
-                caption     = new_text or None
+                chat_id=target, from_chat_id=message.chat.id,
+                message_id=message.id, caption=new_text or None
             )
         else:
-            # Pure text
             await client.send_message(target, new_text or ".")
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
@@ -169,12 +145,9 @@ async def _forward_one(client: Client, message: Message, target: int, new_text: 
 
 
 async def _send_message(client: Client, message: Message, target: int):
-    """Affiliate bot ka message forward karo."""
     try:
         await client.copy_message(
-            chat_id     = target,
-            from_chat_id= message.chat.id,
-            message_id  = message.id
+            chat_id=target, from_chat_id=message.chat.id, message_id=message.id
         )
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
@@ -185,31 +158,37 @@ async def _send_message(client: Client, message: Message, target: int):
 
 async def _affiliate_process(client: Client, original: Message, bot_username: str) -> Message | None:
     """
-    Source message ko affiliate bot ke paas bhejo.
-    Bot ka reply wapas lo.
-    Timeout: 15 seconds.
+    ✅ FIX: Channel messages ko directly forward nahi kar sakte private bot pe.
+    Solution: Message ka text/caption seedha send karo. Media ho toh copy_message.
     """
-    import asyncio
-
-    bot_chat  = await client.get_chat(bot_username)
-    bot_id    = bot_chat.id
-    replied   = asyncio.get_event_loop().create_future()
+    bot_chat = await client.get_chat(bot_username)
+    bot_id   = bot_chat.id
+    replied  = asyncio.get_event_loop().create_future()
 
     async def _wait_reply(_: Client, msg: Message):
         if msg.chat.id == bot_id and not replied.done():
             replied.set_result(msg)
 
-    from pyrogram.handlers import MessageHandler
-    h = MessageHandler(_wait_reply)
+    from pyrogram.handlers import MessageHandler as MH
+    h = MH(_wait_reply)
     client.add_handler(h)
 
     try:
-        # Forward original to affiliate bot
-        await client.forward_messages(
-            chat_id     = bot_id,
-            from_chat_id= original.chat.id,
-            message_ids = original.id
-        )
+        text_to_send = original.text or original.caption or ""
+
+        if text_to_send:
+            # Text/caption seedha bhejo
+            await client.send_message(bot_id, text_to_send)
+        elif original.media:
+            # Pure media: copy_message try karo
+            await client.copy_message(
+                chat_id=bot_id,
+                from_chat_id=original.chat.id,
+                message_id=original.id
+            )
+        else:
+            return None
+
         response = await asyncio.wait_for(replied, timeout=15)
         return response
     except asyncio.TimeoutError:
@@ -219,11 +198,6 @@ async def _affiliate_process(client: Client, original: Message, bot_username: st
         client.remove_handler(h)
 
 
-# ─────────────── Attach new userbot to existing handlers ─────────────────
-
 def attach_client_to_all_handlers(client: Client):
-    """
-    Naya userbot login hone pe usse saare existing handlers do.
-    """
     for h in _handlers.values():
         client.add_handler(h)

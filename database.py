@@ -81,3 +81,10 @@ class Database:
 
 
 db = Database(Config.DATABASE_URI, Config.DATABASE_NAME)
+
+    async def update_rule_field(self, owner_id: int, rule_id: str, field: str, value):
+        """Rule ka ek field update karo."""
+        await self.auto_rules.update_one(
+            {"owner_id": owner_id, "rule_id": rule_id},
+            {"$set": {field: value}}
+        )
