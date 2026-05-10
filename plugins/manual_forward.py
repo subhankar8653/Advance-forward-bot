@@ -1,51 +1,29 @@
 """
 /forward  →  Manual bulk forward
-Flow:
-  1. /forward
-  2. Bot target channels dikhata hai → user select kare
-  3. Source channel link ya forwarded message bhejo
-  4. Start message ID aur End message ID btao
-  5. Confirm → forwarding shuru
-  6. /cancel  → rok do
-
-Userbot use hota hai (agar logged in hai) warna bot use hoga.
+NOTE: Generic messages → plugins/router.py handle karta hai
 """
 import asyncio
 import uuid
 from pyrogram import Client, filters
 from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 from pyrogram.errors import FloodWait, MessageIdInvalid
 from userbot import get_client
 from database import db
-from config import Config
+from state_router import FORWARD_STATE, clear_all
 
-# in-memory state for active forward tasks
-# { task_id: { cancelled: bool } }
 _active: dict[str, dict] = {}
 
-# pending wizard state per user
-# { owner_id: { step, target_id, source_id, start_id, end_id } }
-_wizard: dict[int, dict] = {}
-
-
-# ─────────────────────────────── /forward ────────────────────────────────
 
 @Client.on_message(filters.private & filters.command("forward"))
 async def cmd_forward(bot: Client, msg: Message):
     owner_id = msg.from_user.id
     await db.ensure_user(owner_id, msg.from_user.first_name)
-
-    # Check userbot
     client = await get_client(owner_id)
     if not client:
-        return await msg.reply(
-            "❌ Pehle userbot login karo: /login"
-        )
+        return await msg.reply("❌ Pehle userbot login karo: /login")
 
-    # Target channels dikhao (auto rules wale targets + manual)
     rules = await db.get_auto_rules(owner_id)
     all_targets = set()
     for r in rules:
@@ -61,34 +39,29 @@ async def cmd_forward(bot: Client, msg: Message):
     buttons = []
     for chat_id in all_targets:
         try:
-            chat = await client.get_chat(chat_id)
+            chat  = await client.get_chat(chat_id)
             label = chat.title or str(chat_id)
         except Exception:
             label = str(chat_id)
         buttons.append([InlineKeyboardButton(label, callback_data=f"fwd_target#{owner_id}#{chat_id}")])
-
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"fwd_cancel#{owner_id}")])
 
-    _wizard[owner_id] = {"step": "pick_target"}
+    clear_all(owner_id)
+    FORWARD_STATE[owner_id] = {"step": "pick_target"}
     await msg.reply(
         "📤 **Manual Forward**\n\nKis channel mein forward karna hai?",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
-# ─────────── Callback: target selected ────────────────────────
-
 @Client.on_callback_query(filters.regex(r"^fwd_target#"))
 async def cb_fwd_target(bot: Client, query: CallbackQuery):
     _, owner_id_str, chat_id_str = query.data.split("#")
     owner_id = int(owner_id_str)
-
     if query.from_user.id != owner_id:
         return await query.answer("Yeh tumhara button nahi.", show_alert=True)
-
-    _wizard[owner_id]["target_id"] = int(chat_id_str)
-    _wizard[owner_id]["step"]      = "source"
-
+    FORWARD_STATE[owner_id]["target_id"] = int(chat_id_str)
+    FORWARD_STATE[owner_id]["step"]      = "source"
     await query.message.edit_text(
         "✅ Target set!\n\n"
         "Ab **source channel** ka koi bhi ek message forward karo\n"
@@ -100,36 +73,30 @@ async def cb_fwd_target(bot: Client, query: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^fwd_cancel#"))
 async def cb_fwd_cancel(bot: Client, query: CallbackQuery):
     owner_id = int(query.data.split("#")[1])
-    _wizard.pop(owner_id, None)
+    FORWARD_STATE.pop(owner_id, None)
     await query.message.edit_text("❌ Cancelled.")
 
 
-# ─────────── Message handler for wizard steps ─────────────────
-
-@Client.on_message(filters.private & ~filters.command([
-    "start","login","logout","cancel","forward","auto","rules","settings","status"
-]))
-async def forward_wizard_handler(bot: Client, msg: Message):
+async def handle_forward_step(bot: Client, msg: Message):
+    """router.py se call hota hai"""
     owner_id = msg.from_user.id
-    state    = _wizard.get(owner_id)
+    state    = FORWARD_STATE.get(owner_id)
     if not state:
         return
-
     step = state.get("step")
+    text = (msg.text or "").strip()
 
-    if msg.text and msg.text.strip() == "/cancel":
-        _wizard.pop(owner_id, None)
+    if text.lower() in ("/cancel", "cancel"):
+        FORWARD_STATE.pop(owner_id, None)
         return await msg.reply("❌ Forward cancelled.")
 
-    # ── Step: get source ─────────────────────────────
     if step == "source":
         import re
         source_id = None
-
         if msg.forward_from_chat:
             source_id = msg.forward_from_chat.id
-        elif msg.text:
-            m = re.search(r't\.me/(?:c/)?(\-?\d+|[A-Za-z0-9_]+)', msg.text)
+        elif text:
+            m = re.search(r't\.me/(?:c/)?(\-?\d+|[A-Za-z0-9_]+)', text)
             if m:
                 raw = m.group(1)
                 if raw.lstrip("-").isdigit():
@@ -140,32 +107,24 @@ async def forward_wizard_handler(bot: Client, msg: Message):
                         source_id = chat.id
                     except Exception:
                         pass
-
         if not source_id:
-            return await msg.reply("❌ Source samajh nahi aaya. Channel ka message forward karo ya link bhejo.")
-
+            return await msg.reply("❌ Source samajh nahi aaya.")
         state["source_id"] = source_id
         state["step"]      = "start_id"
-        await msg.reply(
-            "✅ Source set!\n\n"
-            "Ab **start message ID** bhejo\n(jahan se forward shuru karna hai, e.g. `1`)"
-        )
+        await msg.reply("✅ Source set!\n\nAb **start message ID** bhejo (e.g. `1`)")
 
-    # ── Step: start message ID ───────────────────────
     elif step == "start_id":
-        if not msg.text or not msg.text.strip().isdigit():
+        if not text.isdigit():
             return await msg.reply("❌ Sirf number bhejo, e.g. `1`")
-        state["start_id"] = int(msg.text.strip())
+        state["start_id"] = int(text)
         state["step"]     = "end_id"
-        await msg.reply("Ab **end message ID** bhejo (jahan tak forward karna hai, e.g. `10000`)")
+        await msg.reply("Ab **end message ID** bhejo (e.g. `10000`)")
 
-    # ── Step: end message ID → confirm ──────────────
     elif step == "end_id":
-        if not msg.text or not msg.text.strip().isdigit():
+        if not text.isdigit():
             return await msg.reply("❌ Sirf number bhejo, e.g. `10000`")
-        state["end_id"] = int(msg.text.strip())
+        state["end_id"] = int(text)
         state["step"]   = "confirm"
-
         total = state["end_id"] - state["start_id"] + 1
         try:
             client = await get_client(owner_id)
@@ -181,7 +140,6 @@ async def forward_wizard_handler(bot: Client, msg: Message):
             InlineKeyboardButton("✅ Start", callback_data=f"fwd_start#{owner_id}"),
             InlineKeyboardButton("❌ Cancel", callback_data=f"fwd_cancel#{owner_id}")
         ]])
-
         await msg.reply(
             f"📋 **Confirm Forward**\n\n"
             f"• Source: `{src_name}`\n"
@@ -192,15 +150,12 @@ async def forward_wizard_handler(bot: Client, msg: Message):
         )
 
 
-# ─────────── Callback: start forwarding ──────────────────────
-
 @Client.on_callback_query(filters.regex(r"^fwd_start#"))
 async def cb_fwd_start(bot: Client, query: CallbackQuery):
     owner_id = int(query.data.split("#")[1])
     if query.from_user.id != owner_id:
         return await query.answer("Yeh tumhara button nahi.", show_alert=True)
-
-    state = _wizard.pop(owner_id, None)
+    state = FORWARD_STATE.pop(owner_id, None)
     if not state:
         return await query.message.edit_text("❌ State expire ho gaya. /forward dobara karo.")
 
@@ -210,41 +165,27 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
     start_id = state["start_id"]
     end_id   = state["end_id"]
     total    = end_id - start_id + 1
-
     _active[task_id] = {"cancelled": False}
 
     status_msg = await query.message.edit_text(
-        f"⏳ Forwarding shuru...\n"
-        f"Task ID: `{task_id}`\n"
-        f"0 / {total} done\n\n"
+        f"⏳ Forwarding shuru...\nTask ID: `{task_id}`\n0 / {total} done\n\n"
         f"/cancel_{task_id} — stop"
     )
-
     client = await get_client(owner_id)
     asyncio.create_task(
-        _do_forward(client, bot, query.from_user.id, task_id,
-                    source, target, start_id, end_id, total, status_msg)
+        _do_forward(client, owner_id, task_id, source, target, start_id, end_id, total, status_msg)
     )
 
 
-async def _do_forward(client, bot, owner_id, task_id,
-                      source, target, start_id, end_id,
-                      total, status_msg):
+async def _do_forward(client, owner_id, task_id, source, target, start_id, end_id, total, status_msg):
     done = skipped = 0
-    UPDATE_EVERY = 50   # har 50 messages pe status update
-
     for msg_id in range(start_id, end_id + 1):
         if _active.get(task_id, {}).get("cancelled"):
             await _edit_safe(status_msg, f"🛑 Cancelled!\n✅ Done: {done} | ⏭ Skipped: {skipped}")
             _active.pop(task_id, None)
             return
-
         try:
-            await client.forward_messages(
-                chat_id     = target,
-                from_chat_id= source,
-                message_ids = msg_id
-            )
+            await client.forward_messages(chat_id=target, from_chat_id=source, message_ids=msg_id)
             done += 1
         except MessageIdInvalid:
             skipped += 1
@@ -257,29 +198,15 @@ async def _do_forward(client, bot, owner_id, task_id,
                 skipped += 1
         except Exception:
             skipped += 1
-
-        # Sleep to avoid flood
         await asyncio.sleep(0.7)
-
-        if (done + skipped) % UPDATE_EVERY == 0:
+        if (done + skipped) % 50 == 0:
             pct = int((done + skipped) / total * 100)
             bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            await _edit_safe(
-                status_msg,
-                f"📤 Forwarding...\n"
-                f"{bar} {pct}%\n"
-                f"✅ {done} / {total} done | ⏭ {skipped} skipped\n\n"
-                f"/cancel_{task_id} — stop"
-            )
-
-    await _edit_safe(
-        status_msg,
-        f"🎉 **Done!**\n✅ Forwarded: {done}\n⏭ Skipped: {skipped}\nTotal: {total}"
-    )
+            await _edit_safe(status_msg,
+                f"📤 Forwarding...\n{bar} {pct}%\n✅ {done}/{total} | ⏭ {skipped}\n\n/cancel_{task_id} — stop")
+    await _edit_safe(status_msg, f"🎉 **Done!**\n✅ Forwarded: {done}\n⏭ Skipped: {skipped}\nTotal: {total}")
     _active.pop(task_id, None)
 
-
-# ─────────── /cancel_<task_id> ───────────────────────────────
 
 @Client.on_message(filters.private & filters.regex(r"^/cancel_([a-f0-9]+)$"))
 async def cmd_cancel_task(bot: Client, msg: Message):
@@ -290,8 +217,6 @@ async def cmd_cancel_task(bot: Client, msg: Message):
     else:
         await msg.reply("❌ Aisa koi task nahi mila.")
 
-
-# ─────────── helper ──────────────────────────────────────────
 
 async def _edit_safe(message, text: str):
     try:
