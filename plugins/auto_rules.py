@@ -84,7 +84,23 @@ async def handle_auto_step(bot: Client, msg: Message):
         )
 
     elif step == "affiliate":
-        state["affiliate_bot"]  = None if text.lower() == "skip" else text.lstrip("@")
+        if text.lower() == "skip":
+            state["affiliate_bot"] = None
+        else:
+            # Username ya user_id — resolve karke integer ID store karo
+            uname = text.lstrip("@")
+            try:
+                client = await get_client(owner_id)
+                bot_chat = await client.get_chat(uname)
+                state["affiliate_bot"] = bot_chat.id  # integer ID store
+            except Exception:
+                return await msg.reply(
+                    f"❌ Bot `@{uname}` resolve nahi hua.\n"
+                    "Make sure:\n"
+                    "• Username sahi hai\n"
+                    "• Userbot ne us bot se pehle ek baar baat ki ho\n\n"
+                    "Dobara try karo:"
+                )
         state["hide_links"]     = False
         state["hide_usernames"] = False
         state["step"]           = "hide_settings"
@@ -352,7 +368,19 @@ async def handle_edit_step(bot: Client, msg: Message):
         new_val = ids
 
     elif field == "affiliate":
-        new_val = None if text.lower() == "skip" else text.lstrip("@")
+        if text.lower() == "skip":
+            new_val = None
+        else:
+            uname = text.lstrip("@")
+            try:
+                client = await get_client(owner_id)
+                bot_chat = await client.get_chat(uname)
+                new_val = bot_chat.id  # integer ID store
+            except Exception:
+                EDIT_STATE.pop(owner_id, None)
+                return await msg.reply(
+                    f"❌ Bot `@{uname}` resolve nahi hua. Dobara /rules se edit karo."
+                )
 
     elif field == "replace":
         replace_map = {}

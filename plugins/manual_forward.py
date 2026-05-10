@@ -51,7 +51,10 @@ async def cmd_forward(bot: Client, msg: Message):
     if not client:
         return await msg.reply("❌ Pehle userbot login karo: /login")
 
-    args = msg.command[1:]  # command ke baad ke words
+    # msg.text se manually parse — msg.command negative IDs galat split karta hai
+    raw_text = (msg.text or "").strip()
+    parts = raw_text.split()
+    args = parts[1:]  # /forward hatao
 
     # ── Args validate ────────────────────────────────────────
     if len(args) != 4:
