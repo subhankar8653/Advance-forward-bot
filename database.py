@@ -79,12 +79,12 @@ class Database:
     async def delete_task(self, task_id: str):
         await self.tasks.delete_many({"task_id": task_id})
 
-
-db = Database(Config.DATABASE_URI, Config.DATABASE_NAME)
-
     async def update_rule_field(self, owner_id: int, rule_id: str, field: str, value):
         """Rule ka ek field update karo."""
         await self.auto_rules.update_one(
             {"owner_id": owner_id, "rule_id": rule_id},
             {"$set": {field: value}}
         )
+
+
+db = Database(Config.DATABASE_URI, Config.DATABASE_NAME)
