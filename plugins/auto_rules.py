@@ -1,6 +1,6 @@
 """
 /auto    → Create auto-forward rule
-/rules   → List / delete rules
+/rules   → List / delete / EDIT rules
 NOTE: Generic messages → plugins/router.py handle karta hai
 """
 import uuid
@@ -10,7 +10,7 @@ from pyrogram.types import (
 )
 from database import db
 from userbot import get_client
-from state_router import AUTO_STATE, clear_all
+from state_router import AUTO_STATE, EDIT_STATE, clear_all
 
 
 @Client.on_message(filters.private & filters.command("auto"))
@@ -23,7 +23,7 @@ async def cmd_auto(bot: Client, msg: Message):
     AUTO_STATE[owner_id] = {"step": "source"}
     await msg.reply(
         "🔁 **New Auto-Forward Rule**\n\n"
-        "**Step 1/5** — Source channel ka koi bhi message forward karo\n"
+        "**Step 1/5** — Source channel ka koi bhi ek message forward karo\n"
         "ya channel link bhejo\n\n"
         "/cancel — cancel"
     )
@@ -84,10 +84,10 @@ async def handle_auto_step(bot: Client, msg: Message):
         )
 
     elif step == "affiliate":
-        state["affiliate_bot"] = None if text.lower() == "skip" else text.lstrip("@")
-        state["hide_links"]    = False
-        state["hide_usernames"]= False
-        state["step"]          = "hide_settings"
+        state["affiliate_bot"]  = None if text.lower() == "skip" else text.lstrip("@")
+        state["hide_links"]     = False
+        state["hide_usernames"] = False
+        state["step"]           = "hide_settings"
         buttons = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🔗 Hide Links: OFF", callback_data=f"aflag#{owner_id}#hide_links"),
@@ -166,6 +166,8 @@ async def _save_rule(msg: Message, owner_id: int, state: dict):
     )
 
 
+# ───────────────────────── /rules ─────────────────────────────────────────
+
 @Client.on_message(filters.private & filters.command("rules"))
 async def cmd_rules(bot: Client, msg: Message):
     owner_id = msg.from_user.id
@@ -187,7 +189,10 @@ async def cmd_rules(bot: Client, msg: Message):
             f"🔹 `{rid}` — {name} → {len(r['targets'])} target(s)\n"
             f"   Links: {r.get('hide_links',False)} | @hide: {r.get('hide_usernames',False)}"
         )
-        buttons.append([InlineKeyboardButton(f"🗑 Delete {rid}", callback_data=f"del_rule#{owner_id}#{rid}")])
+        buttons.append([
+            InlineKeyboardButton(f"✏️ Edit {rid}", callback_data=f"edit_rule#{owner_id}#{rid}"),
+            InlineKeyboardButton(f"🗑 Delete {rid}", callback_data=f"del_rule#{owner_id}#{rid}")
+        ])
 
     await msg.reply(
         "📋 **Auto-Forward Rules:**\n\n" + "\n\n".join(lines),
@@ -205,3 +210,177 @@ async def cb_del_rule(bot: Client, query: CallbackQuery):
     from auto_listener import unregister_rule
     unregister_rule(rule_id)
     await query.message.edit_text(f"✅ Rule `{rule_id}` delete ho gaya.")
+
+
+# ───────────────────────── EDIT RULE ──────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^edit_rule#"))
+async def cb_edit_rule(bot: Client, query: CallbackQuery):
+    _, owner_id_str, rule_id = query.data.split("#")
+    owner_id = int(owner_id_str)
+    if query.from_user.id != owner_id:
+        return await query.answer("Yeh tumhara nahi.", show_alert=True)
+
+    rule = await db.get_rule_by_id(rule_id)
+    if not rule:
+        return await query.message.edit_text("❌ Rule nahi mila.")
+
+    hl = "ON ✅" if rule.get("hide_links") else "OFF"
+    hu = "ON ✅" if rule.get("hide_usernames") else "OFF"
+    aff = rule.get("affiliate_bot") or "None"
+
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Source Change", callback_data=f"redit#{owner_id}#{rule_id}#source")],
+        [InlineKeyboardButton("📤 Targets Change", callback_data=f"redit#{owner_id}#{rule_id}#targets")],
+        [InlineKeyboardButton(f"🤖 Affiliate: {aff}", callback_data=f"redit#{owner_id}#{rule_id}#affiliate")],
+        [
+            InlineKeyboardButton(f"🔗 Links: {hl}", callback_data=f"redit#{owner_id}#{rule_id}#hide_links"),
+            InlineKeyboardButton(f"👤 @user: {hu}", callback_data=f"redit#{owner_id}#{rule_id}#hide_usernames"),
+        ],
+        [InlineKeyboardButton("🔄 Replace Map", callback_data=f"redit#{owner_id}#{rule_id}#replace")],
+        [InlineKeyboardButton("❌ Close", callback_data=f"redit#{owner_id}#{rule_id}#close")],
+    ])
+    await query.message.edit_text(
+        f"✏️ **Edit Rule** `{rule_id}`\n\n"
+        f"• Source: `{rule['source_id']}`\n"
+        f"• Targets: {len(rule['targets'])} channel(s)\n"
+        f"• Affiliate: {aff}\n"
+        f"• Hide links: {rule.get('hide_links', False)}\n"
+        f"• Hide @users: {rule.get('hide_usernames', False)}\n"
+        f"• Replacements: {len(rule.get('replace_map', {}))}\n\n"
+        "Kya change karna hai?",
+        reply_markup=buttons
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^redit#"))
+async def cb_redit(bot: Client, query: CallbackQuery):
+    parts = query.data.split("#")
+    _, owner_id_str, rule_id, field = parts
+    owner_id = int(owner_id_str)
+    if query.from_user.id != owner_id:
+        return await query.answer("Yeh tumhara nahi.", show_alert=True)
+
+    rule = await db.get_rule_by_id(rule_id)
+    if not rule:
+        return await query.message.edit_text("❌ Rule nahi mila.")
+
+    if field == "close":
+        return await query.message.edit_text("✅ Edit band kar diya.")
+
+    # Toggle fields jo seedha change hote hain
+    if field in ("hide_links", "hide_usernames"):
+        new_val = not rule.get(field, False)
+        await db.update_rule_field(owner_id, rule_id, field, new_val)
+        from auto_listener import _rule_map
+        if rule_id in _rule_map:
+            _rule_map[rule_id][field] = new_val
+        await query.answer(f"{'ON' if new_val else 'OFF'} kar diya!", show_alert=False)
+        # Refresh edit panel
+        rule[field] = new_val
+        hl  = "ON ✅" if rule.get("hide_links") else "OFF"
+        hu  = "ON ✅" if rule.get("hide_usernames") else "OFF"
+        aff = rule.get("affiliate_bot") or "None"
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📥 Source Change", callback_data=f"redit#{owner_id}#{rule_id}#source")],
+            [InlineKeyboardButton("📤 Targets Change", callback_data=f"redit#{owner_id}#{rule_id}#targets")],
+            [InlineKeyboardButton(f"🤖 Affiliate: {aff}", callback_data=f"redit#{owner_id}#{rule_id}#affiliate")],
+            [
+                InlineKeyboardButton(f"🔗 Links: {hl}", callback_data=f"redit#{owner_id}#{rule_id}#hide_links"),
+                InlineKeyboardButton(f"👤 @user: {hu}", callback_data=f"redit#{owner_id}#{rule_id}#hide_usernames"),
+            ],
+            [InlineKeyboardButton("🔄 Replace Map", callback_data=f"redit#{owner_id}#{rule_id}#replace")],
+            [InlineKeyboardButton("❌ Close", callback_data=f"redit#{owner_id}#{rule_id}#close")],
+        ])
+        return await query.message.edit_reply_markup(buttons)
+
+    # Fields jo text input maangein
+    clear_all(owner_id)
+    EDIT_STATE[owner_id] = {"rule_id": rule_id, "field": field}
+
+    prompts = {
+        "source"   : "📥 Naya **source channel** bhejo:\nForward karo ya link do (e.g. `https://t.me/c/123/1`)",
+        "targets"  : "📤 Naye **target channel IDs** bhejo (space se alag):\nExample: `-1001234 -1005678`",
+        "affiliate": "🤖 Naya **affiliate bot** @username bhejo\n(`skip` — remove karne ke liye)",
+        "replace"  : "🔄 Naya **replace map** bhejo\nFormat: `purana | naya` (har line)\n`skip` — replace hata do",
+    }
+    await query.message.edit_text(prompts.get(field, "Value bhejo:") + "\n\n/cancel — cancel")
+
+
+async def handle_edit_step(bot: Client, msg: Message):
+    """router.py se call hota hai"""
+    owner_id = msg.from_user.id
+    state    = EDIT_STATE.get(owner_id)
+    if not state:
+        return
+    text     = (msg.text or "").strip()
+    rule_id  = state["rule_id"]
+    field    = state["field"]
+
+    if text.lower() in ("/cancel", "cancel"):
+        EDIT_STATE.pop(owner_id, None)
+        return await msg.reply("❌ Edit cancel ho gaya.")
+
+    import re
+    new_val = None
+
+    if field == "source":
+        source_id = None
+        if msg.forward_from_chat:
+            source_id = msg.forward_from_chat.id
+        elif text:
+            m = re.search(r't\.me/(?:c/)?(\-?\d+|[A-Za-z0-9_]+)', text)
+            if m:
+                raw = m.group(1)
+                if raw.lstrip("-").isdigit():
+                    source_id = int(("-100" + raw) if not raw.startswith("-") else raw)
+                else:
+                    try:
+                        client = await get_client(owner_id)
+                        chat = await client.get_chat(raw)
+                        source_id = chat.id
+                    except Exception:
+                        pass
+        if not source_id:
+            return await msg.reply("❌ Source samajh nahi aaya. Dobara koshish karo.")
+        new_val = source_id
+
+    elif field == "targets":
+        ids = [int(p) for p in text.split() if p.lstrip("-").isdigit()]
+        if not ids:
+            return await msg.reply("❌ Valid IDs do.")
+        new_val = ids
+
+    elif field == "affiliate":
+        new_val = None if text.lower() == "skip" else text.lstrip("@")
+
+    elif field == "replace":
+        replace_map = {}
+        if text.lower() != "skip":
+            for line in text.split("\n"):
+                if "|" in line:
+                    parts = line.split("|", 1)
+                    replace_map[parts[0].strip()] = parts[1].strip()
+        new_val = replace_map
+
+    # DB update
+    rule = await db.get_rule_by_id(rule_id)
+    if not rule:
+        EDIT_STATE.pop(owner_id, None)
+        return await msg.reply("❌ Rule nahi mila.")
+
+    owner_check = rule.get("owner_id")
+    await db.update_rule_field(owner_check, rule_id, field, new_val)
+
+    # Live _rule_map update
+    from auto_listener import _rule_map, unregister_rule, register_rule
+    if field == "source":
+        # Source change: old listener hata do, naya lagao
+        unregister_rule(rule_id)
+        updated = {**rule, field: new_val}
+        await register_rule(owner_check, updated)
+    elif rule_id in _rule_map:
+        _rule_map[rule_id][field] = new_val
+
+    EDIT_STATE.pop(owner_id, None)
+    await msg.reply(f"✅ Rule `{rule_id}` ka **{field}** update ho gaya!")
