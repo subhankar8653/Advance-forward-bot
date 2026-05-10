@@ -5,7 +5,8 @@ Railway pe:  python main.py
 import asyncio
 import logging
 import os
-from pyrogram import Client
+from pyrogram import Client, idle   # ✅ idle pyrogram se import karo
+from pyrogram.errors import FloodWait
 from config import Config
 
 logging.basicConfig(
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 async def main():
     os.makedirs(Config.SESSION_DIR, exist_ok=True)
 
-    # ── Start the main Bot ──────────────────────────────────
+    # ── Start the main Bot (FloodWait handle karo) ──────────
     bot = Client(
         name        = "ForwardBot",
         api_id      = Config.API_ID,
@@ -28,7 +29,18 @@ async def main():
         in_memory   = True
     )
 
-    await bot.start()
+    # FloodWait pe wait karo — crash mat karo
+    while True:
+        try:
+            await bot.start()
+            break
+        except FloodWait as e:
+            logger.warning(f"FloodWait on bot start: waiting {e.value}s ...")
+            await asyncio.sleep(e.value + 5)
+        except Exception as e:
+            logger.error(f"Bot start error: {e}")
+            raise
+
     me = await bot.get_me()
     logger.info(f"Bot started: @{me.username}")
 
@@ -42,7 +54,7 @@ async def main():
 
     logger.info("All systems ready ✅")
 
-    await bot.idle()
+    await idle()          # ✅ FIXED: bot.idle() nahi, pyrogram.idle()
     await bot.stop()
 
 
