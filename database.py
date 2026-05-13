@@ -43,7 +43,8 @@ class Database:
             return existing.get("slot", 0)
 
         # Naya slot assign karo
-        all_slots = [r["slot"] async for r in self.userbots.find({"owner_id": owner_id})]
+        # .get("slot", 0) use karo taaki purane records (jinka slot field nahi) crash na karein
+        all_slots = [r.get("slot", 0) async for r in self.userbots.find({"owner_id": owner_id})]
         slot = max(all_slots) + 1 if all_slots else 0
         await self.userbots.insert_one({
             "owner_id": owner_id,

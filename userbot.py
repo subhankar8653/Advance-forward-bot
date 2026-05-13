@@ -166,7 +166,10 @@ class LoginSession:
             return "❌ Galat OTP. Dobara bhejo."
         except PhoneCodeExpired:
             cls._pending.pop(owner_id, None)
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             return "❌ OTP expire ho gaya. /addaccount dobara karo."
         except SessionPasswordNeeded:
             pending["step"] = "2fa"
@@ -190,11 +193,31 @@ class LoginSession:
 
     @classmethod
     async def _finish_login(cls, owner_id: int, client: Client, phone: str) -> str:
-        session_string = await client.export_session_string()
-        await client.disconnect()
+        # Step 1: Session export
+        try:
+            session_string = await client.export_session_string()
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            cls._pending.pop(owner_id, None)
+            return f"❌ Session export failed: {e}"
 
-        slot = await db.save_userbot(owner_id, phone, session_string)
+        # Step 2: Temp client disconnect
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
+        # Step 3: DB save (yahan KeyError fix hai database.py mein)
+        try:
+            slot = await db.save_userbot(owner_id, phone, session_string)
+        except Exception as e:
+            cls._pending.pop(owner_id, None)
+            return f"❌ DB save failed: {e}"
+
+        # Step 4: Live client start
         live_client = Client(
             name=f"user_{owner_id}_{slot}",
             api_id=Config.API_ID,
@@ -202,7 +225,11 @@ class LoginSession:
             session_string=session_string,
             in_memory=True
         )
-        await live_client.start()
+        try:
+            await live_client.start()
+        except Exception as e:
+            cls._pending.pop(owner_id, None)
+            return f"❌ Client start failed: {e}"
 
         if owner_id not in _clients:
             _clients[owner_id] = {}
