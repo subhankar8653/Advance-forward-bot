@@ -29,7 +29,7 @@ from pyrogram.types import (
 )
 from pyrogram.errors import FloodWait, MessageIdInvalid
 
-from userbot import get_client
+from userbot import get_client, get_all_clients
 from database import db
 from state_router import FORWARD_STATE, clear_all
 from utils import process_text
@@ -461,7 +461,13 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
         FORWARD_STATE[owner_id] = state
         return await query.answer("❌ Kum se kum ek type select karo!", show_alert=True)
 
-    task_id  = str(uuid.uuid4())[:8]
+    # ── Saare available accounts lo ───────────────────────────────────
+    all_acc = await get_all_clients(owner_id)
+    if not all_acc:
+        return await query.message.edit_text(
+            "❌ Koi account login nahi hai.\n/addaccount se pehle login karo."
+        )
+
     source   = state["source_id"]
     target   = state["target_id"]
     start_id = state["start_id"]
@@ -469,32 +475,63 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
     total    = state["total"]
     hide_lnk = state.get("hide_links", False)
     hide_usr = state.get("hide_usernames", False)
-
-    _active[task_id] = {"cancelled": False}
-    _user_task[owner_id] = task_id  # /stop ke liye
-
     type_labels = [k for k, v in MEDIA_TYPES.items() if v in selected]
     type_str = ", ".join(type_labels) if len(type_labels) < len(MEDIA_TYPES) else "All"
 
+    n_acc = len(all_acc)
+
+    # ── Range ko accounts mein divide karo ───────────────────────────
+    # Example: 3 accounts, 900 msgs → each 300
+    # [start → start+299], [start+300 → start+599], [start+600 → end]
+    all_ids    = list(range(start_id, end_id + 1))
+    chunk_size = max(1, len(all_ids) // n_acc)
+    chunks     = []
+    for i, (slot, _) in enumerate(all_acc):
+        s = i * chunk_size
+        e = s + chunk_size if i < n_acc - 1 else len(all_ids)
+        chunk = all_ids[s:e]
+        if chunk:
+            chunks.append((slot, all_acc[i][1], chunk))
+
+    # ── Master task ID ────────────────────────────────────────────────
+    master_id = str(uuid.uuid4())[:8]
+    _active[master_id] = {"cancelled": False}
+    _user_task[owner_id] = master_id
+
+    acc_info = "\n".join(
+        f"  Account {slot}: msg {chunk[0]}→{chunk[-1]} ({len(chunk)} msgs)"
+        for slot, _, chunk in chunks
+    )
+
     status_msg = await query.message.edit_text(
         f"⏳ **Forwarding shuru...**\n"
-        f"Task ID: `{task_id}`\n"
+        f"Task: `{master_id}`\n"
         f"Types: {type_str}\n"
-        f"0 / {total} done\n\n"
+        f"📊 {n_acc} account(s) kaam karengy:\n"
+        f"{acc_info}\n\n"
         f"/stop — forward band karo"
     )
 
-    client = await get_client(owner_id)
+    # ── Saare chunks parallel mein launch karo ────────────────────────
     asyncio.create_task(
-        _do_forward(
-            client, task_id, owner_id,
-            source, target, start_id, end_id, total,
-            list(selected), hide_lnk, hide_usr, status_msg
+        _run_multi_forward(
+            master_id, owner_id, chunks, source, target,
+            list(selected), hide_lnk, hide_usr, total, status_msg
         )
     )
 
 
-# ═══════════════════════ CORE FORWARD LOOP ═══════════════════════════════
+# ═══════════════════════ ROUND-ROBIN FORWARD SYSTEM ══════════════════════
+#
+# Flow (3 accounts, messages 1-9):
+#   Turn 1 → Account 0 forwards msg 1, then sleeps
+#   Turn 2 → Account 1 forwards msg 2, then sleeps
+#   Turn 3 → Account 2 forwards msg 3, then sleeps
+#   Turn 4 → Account 0 forwards msg 4 ... and so on
+#
+# Har account ko effectively (n_accounts × 1s) = 3s rest milta hai
+# Yeh Telegram ke liye safest pattern hai — ban risk near-zero
+# ─────────────────────────────────────────────────────────────────────────
 
 def _msg_matches_type(message: Message, selected_types: list) -> bool:
     if not message or message.empty:
@@ -512,113 +549,145 @@ def _msg_matches_type(message: Message, selected_types: list) -> bool:
     return False
 
 
-async def _do_forward(
-    client, task_id, owner_id,
-    source, target, start_id, end_id, total,
-    sel_types, hide_lnk, hide_usr, status_msg
-):
-    done = skipped = filtered = 0
-    last_errors = []   # debug ke liye last 3 errors track karo
-    BATCH = 15
+async def _forward_one(client, source, target, msg_id,
+                       sel_types, hide_lnk, hide_usr) -> str:
+    """
+    Ek message forward karne ki koshish karo.
+    Returns: 'done' | 'skip' | 'filter' | 'flood:<seconds>'
+    """
+    try:
+        fetched_list = await client.get_messages(source, [msg_id])
+        fetched = fetched_list[0] if fetched_list else None
 
-    for msg_id in range(start_id, end_id + 1):
-        if _active.get(task_id, {}).get("cancelled"):
+        if not fetched or fetched.empty or fetched.id == 0:
+            return "skip"
+
+        if not _msg_matches_type(fetched, sel_types):
+            return "filter"
+
+        if hide_lnk or hide_usr:
+            raw = fetched.text or fetched.caption or ""
+            new_text = process_text(raw, hide_links=hide_lnk, hide_usernames=hide_usr)
+            if fetched.media:
+                await client.copy_message(
+                    chat_id=target, from_chat_id=source,
+                    message_id=msg_id, caption=new_text or None
+                )
+            else:
+                if new_text:
+                    await client.send_message(target, new_text)
+                else:
+                    return "skip"
+        else:
+            await client.copy_message(
+                chat_id=target, from_chat_id=source, message_id=msg_id
+            )
+        return "done"
+
+    except MessageIdInvalid:
+        return "skip"
+    except FloodWait as e:
+        return f"flood:{e.value + 2}"
+    except Exception:
+        return "skip"
+
+
+async def _run_multi_forward(
+    master_id, owner_id, chunks, source, target,
+    sel_types, hide_lnk, hide_usr, total, status_msg
+):
+    """
+    Round-Robin forwarding:
+    Saare messages ek queue mein hain.
+    Accounts baari baari ek-ek message lete hain.
+    """
+    # Saari IDs ek flat queue mein
+    all_msg_ids = []
+    for _, _, ids in chunks:
+        all_msg_ids.extend(ids)
+
+    # Sirf clients ki list (slot order mein)
+    clients = [(slot, client) for slot, client, _ in chunks]
+    n = len(clients)
+
+    done = skipped = filtered = 0
+    idx  = 0          # queue pointer
+    turn = 0          # round-robin turn (0 → n-1)
+    PROGRESS_EVERY = 15
+
+    while idx < len(all_msg_ids):
+        # Cancel check
+        if _active.get(master_id, {}).get("cancelled"):
             await _edit_safe(status_msg,
-                f"🛑 **Forward Stopped!**\n\n"
+                f"🛑 **Stopped!**\n\n"
                 f"✅ Forwarded: {done}\n"
                 f"⏭ Skipped: {skipped}\n"
-                f"🔽 Filtered: {filtered}"
+                f"🔽 Filtered: {filtered}\n"
+                f"📊 Checked: {done + skipped + filtered} / {total}"
             )
-            _active.pop(task_id, None)
+            _active.pop(master_id, None)
             _user_task.pop(owner_id, None)
             return
 
-        try:
-            # ✅ FIX 1: list mein dena zaroori hai
-            # single int dene pe Pyrogram restricted/private channels mein
-            # empty Message object return karta hai — yahi sab skip hone ki wajah thi
-            fetched_list = await client.get_messages(source, [msg_id])
-            fetched = fetched_list[0] if fetched_list else None
+        slot, client = clients[turn % n]
+        msg_id       = all_msg_ids[idx]
 
-            if not fetched or fetched.empty or fetched.id == 0:
-                skipped += 1
-                continue
+        result = await _forward_one(
+            client, source, target, msg_id,
+            sel_types, hide_lnk, hide_usr
+        )
 
-            if not _msg_matches_type(fetched, sel_types):
-                filtered += 1
-                continue
-
-            if hide_lnk or hide_usr:
-                raw = fetched.text or fetched.caption or ""
-                new_text = process_text(raw, hide_links=hide_lnk, hide_usernames=hide_usr)
-                if fetched.media:
-                    await client.copy_message(
-                        chat_id=target, from_chat_id=source,
-                        message_id=msg_id, caption=new_text or None
-                    )
-                else:
-                    if new_text:
-                        await client.send_message(target, new_text)
-                    else:
-                        skipped += 1
-                        continue
-            else:
-                # ✅ FIX 2: copy_message use karo — forward_messages pe
-                # kuch channels "forwards restricted" hote hain, copy_message kaam karta hai
-                await client.copy_message(
-                    chat_id=target, from_chat_id=source, message_id=msg_id
-                )
-            done += 1
-
-        except MessageIdInvalid:
-            skipped += 1
-        except FloodWait as e:
-            wait = e.value + 2
+        if result.startswith("flood:"):
+            # Is account ko wait karwa do, baaki accounts se continue karo
+            wait_sec = int(result.split(":")[1])
             await _edit_safe(status_msg,
-                f"⏳ FloodWait {wait}s...\n✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n\n"
-                f"/stop — cancel"
-            )
-            await asyncio.sleep(wait)
-            try:
-                await client.copy_message(
-                    chat_id=target, from_chat_id=source, message_id=msg_id
-                )
-                done += 1
-            except Exception:
-                skipped += 1
-        except Exception as e:
-            skipped += 1
-            # Last 3 errors track karo taaki Done message mein dikh sake
-            last_errors = (last_errors + [f"#{msg_id}: {str(e)[:50]}"])[-3:]
-
-        await asyncio.sleep(1)
-
-        processed = done + skipped + filtered
-        if processed % BATCH == 0 and processed > 0:
-            await asyncio.sleep(3)
-            pct = int(processed / total * 100)
-            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            await _edit_safe(status_msg,
-                f"📤 **Forwarding...**\n"
-                f"{bar} {pct}%\n"
+                f"⏳ Account {slot} FloodWait {wait_sec}s...\n"
                 f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n\n"
                 f"/stop — cancel"
             )
+            await asyncio.sleep(wait_sec)
+            # Same message retry karega, turn same rakhenge
+            continue
+        elif result == "done":
+            done += 1
+        elif result == "filter":
+            filtered += 1
+        else:
+            skipped += 1
 
-    err_text = ("\n\n⚠️ Last errors:\n" + "\n".join(last_errors)) if last_errors else ""
+        idx  += 1
+        turn += 1
+
+        # Progress update
+        processed = done + skipped + filtered
+        if processed % PROGRESS_EVERY == 0 and processed > 0:
+            pct = int(processed / total * 100)
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            acc_turn = clients[turn % n][0]
+            await _edit_safe(status_msg,
+                f"📤 **Forwarding... (Round-Robin)**\n"
+                f"{bar} {pct}%\n"
+                f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n"
+                f"🔄 Next: Account {acc_turn}\n\n"
+                f"/stop — cancel"
+            )
+
+        # 1 second delay — har message ke baad
+        # Matlab har account ko effectively (n × 1s) rest milta hai
+        await asyncio.sleep(1)
+
+    # Done!
     await _edit_safe(status_msg,
         f"🎉 **Done!**\n\n"
         f"✅ Forwarded: {done}\n"
         f"⏭ Skipped (deleted/empty): {skipped}\n"
         f"🔽 Filtered (type): {filtered}\n"
-        f"📊 Total checked: {total}"
-        f"{err_text}"
+        f"📊 Total checked: {total}\n"
+        f"👥 Accounts used: {n} (Round-Robin)"
     )
-    _active.pop(task_id, None)
+    _active.pop(master_id, None)
     _user_task.pop(owner_id, None)
 
-
-# ─────────────────────────────────────────────────────────────────────────
 
 async def _edit_safe(message, text: str):
     try:
