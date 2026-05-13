@@ -8,10 +8,11 @@ class Database:
         db = self._client[name]
 
         # collections
-        self.users      = db.users
-        self.userbots   = db.userbots       # ab multiple per owner
-        self.auto_rules = db.auto_rules
-        self.tasks      = db.tasks
+        self.users        = db.users
+        self.userbots     = db.userbots       # multiple userbot accounts per owner
+        self.worker_bots  = db.worker_bots    # NEW: multiple bot tokens per owner
+        self.auto_rules   = db.auto_rules
+        self.tasks        = db.tasks
 
     # ────────────────────────────── USERS ──────────────────────────────
 
@@ -23,17 +24,8 @@ class Database:
         return self.users.find({})
 
     # ────────────────────────── USERBOT (MULTI) ─────────────────────────
-    #
-    # Schema: { owner_id, phone, session, slot }
-    # slot = 0, 1, 2, ... (account number, 0-indexed)
-    # Ek owner ke multiple accounts ho sakte hain
-    # ─────────────────────────────────────────────────────────────────────
 
     async def save_userbot(self, owner_id: int, phone: str, session_string: str):
-        """
-        Naya account add karo. Agar same phone pehle se hai toh update karo.
-        Slot automatically assign hoga (0, 1, 2...)
-        """
         existing = await self.userbots.find_one({"owner_id": owner_id, "phone": phone})
         if existing:
             await self.userbots.update_one(
@@ -41,9 +33,6 @@ class Database:
                 {"$set": {"session": session_string}}
             )
             return existing.get("slot", 0)
-
-        # Naya slot assign karo
-        # .get("slot", 0) use karo taaki purane records (jinka slot field nahi) crash na karein
         all_slots = [r.get("slot", 0) async for r in self.userbots.find({"owner_id": owner_id})]
         slot = max(all_slots) + 1 if all_slots else 0
         await self.userbots.insert_one({
@@ -55,11 +44,9 @@ class Database:
         return slot
 
     async def get_userbot(self, owner_id: int):
-        """Pehla (slot=0) userbot return karo — backward compatibility."""
         return await self.userbots.find_one({"owner_id": owner_id, "slot": 0})
 
     async def get_all_userbots(self, owner_id: int) -> list:
-        """Owner ke saare accounts return karo, slot order mein."""
         docs = [r async for r in self.userbots.find({"owner_id": owner_id})]
         return sorted(docs, key=lambda x: x.get("slot", 0))
 
@@ -67,9 +54,7 @@ class Database:
         return await self.userbots.find_one({"owner_id": owner_id, "slot": slot})
 
     async def delete_userbot_by_slot(self, owner_id: int, slot: int):
-        """Ek specific account remove karo."""
         await self.userbots.delete_one({"owner_id": owner_id, "slot": slot})
-        # Slots re-number karo taaki gap na rahe
         remaining = sorted(
             [r async for r in self.userbots.find({"owner_id": owner_id})],
             key=lambda x: x.get("slot", 0)
@@ -78,12 +63,47 @@ class Database:
             await self.userbots.update_one({"_id": doc["_id"]}, {"$set": {"slot": i}})
 
     async def delete_userbot(self, owner_id: int):
-        """Saare accounts ek saath remove karo."""
         await self.userbots.delete_many({"owner_id": owner_id})
 
     async def get_all_userbot_records(self):
-        """Startup pe saare records load karne ke liye."""
         return [r async for r in self.userbots.find({})]
+
+    # ─────────────────────── WORKER BOTS (NEW) ──────────────────────────
+    # Schema: { owner_id, token, name, username, slot }
+
+    async def save_worker(self, owner_id: int, token: str, name: str, username: str) -> int:
+        all_slots = [r.get("slot", 0) async for r in self.worker_bots.find({"owner_id": owner_id})]
+        slot = max(all_slots) + 1 if all_slots else 0
+        await self.worker_bots.insert_one({
+            "owner_id": owner_id,
+            "token":    token,
+            "name":     name,
+            "username": username,
+            "slot":     slot
+        })
+        return slot
+
+    async def get_all_workers(self, owner_id: int) -> list:
+        docs = [r async for r in self.worker_bots.find({"owner_id": owner_id})]
+        return sorted(docs, key=lambda x: x.get("slot", 0))
+
+    async def delete_worker_by_slot(self, owner_id: int, slot: int) -> bool:
+        result = await self.worker_bots.delete_one({"owner_id": owner_id, "slot": slot})
+        if result.deleted_count == 0:
+            return False
+        remaining = sorted(
+            [r async for r in self.worker_bots.find({"owner_id": owner_id})],
+            key=lambda x: x.get("slot", 0)
+        )
+        for i, doc in enumerate(remaining):
+            await self.worker_bots.update_one({"_id": doc["_id"]}, {"$set": {"slot": i}})
+        return True
+
+    async def delete_all_workers(self, owner_id: int):
+        await self.worker_bots.delete_many({"owner_id": owner_id})
+
+    async def get_all_worker_records(self) -> list:
+        return [r async for r in self.worker_bots.find({})]
 
     # ────────────────────────── AUTO RULES ─────────────────────────────
 

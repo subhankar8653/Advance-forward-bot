@@ -5,7 +5,7 @@ Railway pe:  python main.py
 import asyncio
 import logging
 import os
-from pyrogram import Client, idle   # ✅ idle pyrogram se import karo
+from pyrogram import Client, idle
 from pyrogram.errors import FloodWait
 from config import Config
 
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 async def main():
     os.makedirs(Config.SESSION_DIR, exist_ok=True)
 
-    # ── Start the main Bot (FloodWait handle karo) ──────────
+    # ── Start the main Bot ──────────────────────────────────
     bot = Client(
         name        = "ForwardBot",
         api_id      = Config.API_ID,
@@ -29,7 +29,6 @@ async def main():
         in_memory   = True
     )
 
-    # FloodWait pe wait karo — crash mat karo
     while True:
         try:
             await bot.start()
@@ -42,19 +41,23 @@ async def main():
             raise
 
     me = await bot.get_me()
-    logger.info(f"Bot started: @{me.username}")
+    logger.info(f"Main bot started: @{me.username}")
 
     # ── Start saved userbots ────────────────────────────────
     from userbot import start_all_clients
     await start_all_clients()
+
+    # ── Start saved worker bots ─────────────────────────────
+    from worker_bots import start_all_workers
+    await start_all_workers()
+    logger.info("Worker bots loaded ✅")
 
     # ── Attach auto-listeners to userbots ───────────────────
     from auto_listener import start_listeners
     await start_listeners()
 
     logger.info("All systems ready ✅")
-
-    await idle()          # ✅ FIXED: bot.idle() nahi, pyrogram.idle()
+    await idle()
     await bot.stop()
 
 
