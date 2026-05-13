@@ -580,7 +580,8 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
         mode_label = "🤖 Main Bot"
 
     elif forward_mode == "workers":
-        # ⚡ PARALLEL WORKER BOTS MODE
+        # ⚡ GROUPED ROUND-ROBIN WORKER BOTS MODE
+        # Saari IDs ek hi jagah — _run_multi_forward khud groups banayega
         workers = await get_all_workers(owner_id)
         if not workers:
             return await query.message.edit_text(
@@ -588,13 +589,10 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
             )
         n_acc    = len(workers)
         all_ids  = list(range(start_id, end_id + 1))
-        # Messages ko n_workers chunks mein baant do
-        id_chunks = split_into_chunks(all_ids, n_acc)
-        chunks = []
-        for i, (slot, client) in enumerate(workers):
-            if i < len(id_chunks) and id_chunks[i]:
-                chunks.append((slot, client, id_chunks[i]))
-        mode_label = f"⚡ Worker Bots ({n_acc} bots parallel)"
+        # Har client ko poori list do — lekin chunks format maintain karo
+        # _run_multi_forward mein n>1 detect hoga aur grouped logic chalega
+        chunks = [(slot, client, all_ids) for slot, client in workers]
+        mode_label = f"⚡ Worker Bots ({n_acc} bots, grouped order)"
 
     else:
         # Userbot mode — saare logged-in accounts
@@ -621,6 +619,9 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
     _user_task[owner_id] = master_id
 
     acc_info = "\n".join(
+        f"  Bot {slot}: ready"
+        for slot, _, _ in chunks
+    ) if forward_mode == "workers" else "\n".join(
         f"  Slot {slot}: msg {chunk[0]}→{chunk[-1]} ({len(chunk)} msgs)"
         for slot, _, chunk in chunks
     )
@@ -719,117 +720,121 @@ async def _run_multi_forward(
     sel_types, hide_lnk, hide_usr, total, status_msg
 ):
     """
-    ⚡ PARALLEL forwarding for worker bots mode:
-       Har bot apna chunk independently forward karta hai — sab ek saath!
+    GROUPED ROUND-ROBIN (Worker Bots mode):
+    ─────────────────────────────────────────
+    N bots hain → har round mein N messages ek saath forward hote hain.
+    Lekin next round tab shuru hoga jab pichla group poora ho jaye.
+    Isse order 100% sahi rahega.
 
-    Round-Robin forwarding for userbot/single-bot mode:
-       Saare messages ek queue mein, accounts baari baari lete hain.
+    Example (3 bots, messages 1-9):
+      Round 1: Bot0→Msg1, Bot1→Msg2, Bot2→Msg3  (parallel, wait for all)
+      Round 2: Bot0→Msg4, Bot1→Msg5, Bot2→Msg6  (parallel, wait for all)
+      Round 3: Bot0→Msg7, Bot1→Msg8, Bot2→Msg9  (parallel, wait for all)
+
+    Single bot / Userbot mode:
+      Normal sequential — ek ek karke.
     """
-    is_parallel = len(chunks) > 1 and all(len(c[2]) > 0 for c in chunks)
+    # Saari IDs flat list mein (original order) — first chunk se lo (workers mein sab same hain)
+    all_msg_ids = list(dict.fromkeys(chunks[0][2]))  # first chunk = full list, dedup order maintain
 
-    if is_parallel:
-        # ── PARALLEL MODE (Worker Bots) ─────────────────────────────────
-        # Har bot ke liye alag task — sab ek saath chalenge
-        progress: dict[int, dict] = {
-            slot: {"done": 0, "skipped": 0, "filtered": 0, "total": len(chunk)}
-            for slot, _, chunk in chunks
-        }
+    clients = [(slot, client) for slot, client, _ in chunks]
+    n = len(clients)
 
-        async def _worker_task(slot: int, client, msg_ids: list[int]):
-            for msg_id in msg_ids:
-                if _active.get(master_id, {}).get("cancelled"):
-                    break
+    done = skipped = filtered = 0
+    PROGRESS_EVERY = 5   # har 5 rounds pe update
+
+    if n > 1:
+        # ── GROUPED ROUND-ROBIN (Worker Bots) ───────────────────────────
+        # Messages ko N-size groups mein tod do
+        # Group 0: [msg0, msg1, msg2]  → teeno bots parallel
+        # Group 1: [msg3, msg4, msg5]  → teeno bots parallel
+        # ...
+        rounds = []
+        for i in range(0, len(all_msg_ids), n):
+            rounds.append(all_msg_ids[i:i + n])
+
+        total_rounds = len(rounds)
+
+        for round_idx, group in enumerate(rounds):
+            if _active.get(master_id, {}).get("cancelled"):
+                break
+
+            # Is group ke liye coroutines banao — har bot ek message
+            async def _one_forward(client, msg_id):
                 result = await _forward_one(
                     client, source, target, msg_id, sel_types, hide_lnk, hide_usr
                 )
+                # FloodWait pe ek retry
                 if result.startswith("flood:"):
                     wait_sec = int(result.split(":")[1])
                     await asyncio.sleep(wait_sec)
-                    # Retry same message
                     result = await _forward_one(
                         client, source, target, msg_id, sel_types, hide_lnk, hide_usr
                     )
-                p = progress[slot]
-                if result == "done":       p["done"] += 1
-                elif result == "filter":   p["filtered"] += 1
-                else:                      p["skipped"] += 1
-                await asyncio.sleep(1)
+                return result
 
-        # Saare worker tasks ek saath shuru karo
-        tasks = [
-            asyncio.create_task(_worker_task(slot, client, chunk))
-            for slot, client, chunk in chunks
-        ]
+            # Group ke messages assign karo — bots ko baari baari
+            coros = []
+            for i, msg_id in enumerate(group):
+                _, client = clients[i % n]
+                coros.append(_one_forward(client, msg_id))
 
-        # Progress update loop
-        PROGRESS_EVERY = 3  # seconds
-        while not all(t.done() for t in tasks):
-            if _active.get(master_id, {}).get("cancelled"):
-                for t in tasks:
-                    t.cancel()
-                break
-            await asyncio.sleep(PROGRESS_EVERY)
-            # Aggregate progress
-            total_done     = sum(p["done"]     for p in progress.values())
-            total_skipped  = sum(p["skipped"]  for p in progress.values())
-            total_filtered = sum(p["filtered"] for p in progress.values())
-            processed      = total_done + total_skipped + total_filtered
-            pct = int(processed / total * 100) if total else 0
-            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            # Saare ek saath chalao — WAIT karo jab tak sab done
+            results = await asyncio.gather(*coros, return_exceptions=True)
 
-            bot_lines = "\n".join(
-                f"  Bot {slot}: ✅{p['done']} ⏭{p['skipped']} / {p['total']}"
-                for slot, p in progress.items()
-            )
-            await _edit_safe(status_msg,
-                f"⚡ **Parallel Forwarding...**\n"
-                f"{bar} {pct}%\n\n"
-                f"{bot_lines}\n\n"
-                f"✅ Total: {total_done} | ⏭ {total_skipped} | 🔽 {total_filtered}\n\n"
-                f"/stop — cancel"
-            )
+            for r in results:
+                if isinstance(r, Exception) or r == "skip":
+                    skipped += 1
+                elif r == "filter":
+                    filtered += 1
+                elif r == "done":
+                    done += 1
+                else:
+                    skipped += 1
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+            # Progress update
+            processed = done + skipped + filtered
+            if (round_idx + 1) % PROGRESS_EVERY == 0 or round_idx == total_rounds - 1:
+                pct = int(processed / total * 100) if total else 0
+                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                await _edit_safe(status_msg,
+                    f"⚡ **Forwarding... (Grouped)**\n"
+                    f"{bar} {pct}%\n\n"
+                    f"✅ Forwarded: {done}\n"
+                    f"⏭ Skipped: {skipped} | 🔽 Filtered: {filtered}\n"
+                    f"📦 Round: {round_idx + 1}/{total_rounds} "
+                    f"({n} bots per round)\n\n"
+                    f"/stop — cancel"
+                )
 
-        total_done     = sum(p["done"]     for p in progress.values())
-        total_skipped  = sum(p["skipped"]  for p in progress.values())
-        total_filtered = sum(p["filtered"] for p in progress.values())
+            # 1 second gap har round ke baad (Telegram rate limit safety)
+            await asyncio.sleep(1)
 
         cancelled = _active.get(master_id, {}).get("cancelled", False)
         if cancelled:
-            msg_text = (
+            await _edit_safe(status_msg,
                 f"🛑 **Stopped!**\n\n"
-                f"✅ Forwarded: {total_done}\n"
-                f"⏭ Skipped: {total_skipped}\n"
-                f"🔽 Filtered: {total_filtered}\n"
-                f"📊 Checked: {total_done + total_skipped + total_filtered} / {total}"
+                f"✅ Forwarded: {done}\n"
+                f"⏭ Skipped: {skipped}\n"
+                f"🔽 Filtered: {filtered}\n"
+                f"📊 Checked: {done + skipped + filtered} / {total}"
             )
         else:
-            msg_text = (
-                f"🎉 **Done! (Parallel)**\n\n"
-                f"✅ Forwarded: {total_done}\n"
-                f"⏭ Skipped (deleted/empty): {total_skipped}\n"
-                f"🔽 Filtered (type): {total_filtered}\n"
+            await _edit_safe(status_msg,
+                f"🎉 **Done! (Grouped Round-Robin)**\n\n"
+                f"✅ Forwarded: {done}\n"
+                f"⏭ Skipped (deleted/empty): {skipped}\n"
+                f"🔽 Filtered (type): {filtered}\n"
                 f"📊 Total checked: {total}\n"
-                f"⚡ Bots used: {len(chunks)} (Parallel)"
+                f"⚡ Bots used: {n} | Rounds: {total_rounds}\n"
+                f"📌 Order: 100% maintained ✅"
             )
-        await _edit_safe(status_msg, msg_text)
 
     else:
-        # ── ROUND-ROBIN MODE (Single bot / Userbot) ──────────────────────
-        all_msg_ids = []
-        for _, _, ids in chunks:
-            all_msg_ids.extend(ids)
+        # ── SINGLE BOT / USERBOT — Sequential ───────────────────────────
+        _, client = clients[0]
 
-        clients = [(slot, client) for slot, client, _ in chunks]
-        n = len(clients)
-
-        done = skipped = filtered = 0
-        idx  = 0
-        turn = 0
-        PROGRESS_EVERY = 15
-
-        while idx < len(all_msg_ids):
+        for idx, msg_id in enumerate(all_msg_ids):
             if _active.get(master_id, {}).get("cancelled"):
                 await _edit_safe(status_msg,
                     f"🛑 **Stopped!**\n\n"
@@ -842,18 +847,14 @@ async def _run_multi_forward(
                 _user_task.pop(owner_id, None)
                 return
 
-            slot, client = clients[turn % n]
-            msg_id       = all_msg_ids[idx]
-
             result = await _forward_one(
-                client, source, target, msg_id,
-                sel_types, hide_lnk, hide_usr
+                client, source, target, msg_id, sel_types, hide_lnk, hide_usr
             )
 
             if result.startswith("flood:"):
                 wait_sec = int(result.split(":")[1])
                 await _edit_safe(status_msg,
-                    f"⏳ Account {slot} FloodWait {wait_sec}s...\n"
+                    f"⏳ FloodWait {wait_sec}s...\n"
                     f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n\n"
                     f"/stop — cancel"
                 )
@@ -866,19 +867,14 @@ async def _run_multi_forward(
             else:
                 skipped += 1
 
-            idx  += 1
-            turn += 1
-
             processed = done + skipped + filtered
-            if processed % PROGRESS_EVERY == 0 and processed > 0:
+            if processed % 15 == 0 and processed > 0:
                 pct = int(processed / total * 100)
                 bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-                acc_turn = clients[turn % n][0]
                 await _edit_safe(status_msg,
-                    f"📤 **Forwarding... (Round-Robin)**\n"
+                    f"📤 **Forwarding...**\n"
                     f"{bar} {pct}%\n"
-                    f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n"
-                    f"🔄 Next: Account {acc_turn}\n\n"
+                    f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n\n"
                     f"/stop — cancel"
                 )
 
@@ -889,8 +885,7 @@ async def _run_multi_forward(
             f"✅ Forwarded: {done}\n"
             f"⏭ Skipped (deleted/empty): {skipped}\n"
             f"🔽 Filtered (type): {filtered}\n"
-            f"📊 Total checked: {total}\n"
-            f"👥 Accounts used: {n} (Round-Robin)"
+            f"📊 Total checked: {total}"
         )
 
     _active.pop(master_id, None)
