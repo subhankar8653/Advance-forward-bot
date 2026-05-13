@@ -518,6 +518,7 @@ async def _do_forward(
     sel_types, hide_lnk, hide_usr, status_msg
 ):
     done = skipped = filtered = 0
+    last_errors = []   # debug ke liye last 3 errors track karo
     BATCH = 15
 
     for msg_id in range(start_id, end_id + 1):
@@ -533,9 +534,13 @@ async def _do_forward(
             return
 
         try:
-            fetched = await client.get_messages(source, msg_id)
+            # ✅ FIX 1: list mein dena zaroori hai
+            # single int dene pe Pyrogram restricted/private channels mein
+            # empty Message object return karta hai — yahi sab skip hone ki wajah thi
+            fetched_list = await client.get_messages(source, [msg_id])
+            fetched = fetched_list[0] if fetched_list else None
 
-            if not fetched or fetched.empty:
+            if not fetched or fetched.empty or fetched.id == 0:
                 skipped += 1
                 continue
 
@@ -558,8 +563,10 @@ async def _do_forward(
                         skipped += 1
                         continue
             else:
-                await client.forward_messages(
-                    chat_id=target, from_chat_id=source, message_ids=msg_id
+                # ✅ FIX 2: copy_message use karo — forward_messages pe
+                # kuch channels "forwards restricted" hote hain, copy_message kaam karta hai
+                await client.copy_message(
+                    chat_id=target, from_chat_id=source, message_id=msg_id
                 )
             done += 1
 
@@ -573,12 +580,16 @@ async def _do_forward(
             )
             await asyncio.sleep(wait)
             try:
-                await client.forward_messages(target, source, msg_id)
+                await client.copy_message(
+                    chat_id=target, from_chat_id=source, message_id=msg_id
+                )
                 done += 1
             except Exception:
                 skipped += 1
-        except Exception:
+        except Exception as e:
             skipped += 1
+            # Last 3 errors track karo taaki Done message mein dikh sake
+            last_errors = (last_errors + [f"#{msg_id}: {str(e)[:50]}"])[-3:]
 
         await asyncio.sleep(1)
 
@@ -594,12 +605,14 @@ async def _do_forward(
                 f"/stop — cancel"
             )
 
+    err_text = ("\n\n⚠️ Last errors:\n" + "\n".join(last_errors)) if last_errors else ""
     await _edit_safe(status_msg,
         f"🎉 **Done!**\n\n"
         f"✅ Forwarded: {done}\n"
         f"⏭ Skipped (deleted/empty): {skipped}\n"
         f"🔽 Filtered (type): {filtered}\n"
         f"📊 Total checked: {total}"
+        f"{err_text}"
     )
     _active.pop(task_id, None)
     _user_task.pop(owner_id, None)
