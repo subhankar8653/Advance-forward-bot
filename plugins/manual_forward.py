@@ -337,10 +337,16 @@ async def _show_hide_opts(target, owner_id: int):
         f"**Step — Hide options choose karo:**"
     )
 
-    if hasattr(target, 'edit_text'):
-        await target.edit_text(text, reply_markup=buttons)
-    else:
-        await target.reply(text, reply_markup=buttons)
+    # CallbackQuery.message (bot ka message) → edit karo
+    # User ka message → reply karo (edit nahi kar sakte)
+    is_bot_msg = hasattr(target, 'edit_text') and getattr(target, 'from_user', None) is None
+    if is_bot_msg:
+        try:
+            await target.edit_text(text, reply_markup=buttons)
+            return
+        except Exception:
+            pass
+    await target.reply(text, reply_markup=buttons)
 
 
 # ─────────────────── Hide options callback ───────────────────────────────
