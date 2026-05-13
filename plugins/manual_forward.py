@@ -597,40 +597,78 @@ async def _run_multi_forward(
     sel_types, hide_lnk, hide_usr, total, status_msg
 ):
     """
-    Round-Robin forwarding:
-    Saare messages ek queue mein hain.
-    Accounts baari baari ek-ek message lete hain.
+    Smart Adaptive Round-Robin forwarding.
+
+    Strategy (ban-safe + fast):
+    - Base delay: 0.5s per message per account
+    - Har account ko effectively (n x 0.5s) rest milta hai
+    - Agar 3 consecutive successes -> delay thoda kam (min 0.3s)
+    - Agar FloodWait aaye -> delay temporarily badh jaata hai
+    - Agar koi account flood ho -> woh skip, baaki continue karte hain
+    - Batch mode: har 5 messages ke baad 0.5s extra pause
     """
-    # Saari IDs ek flat queue mein
+    import time
+
     all_msg_ids = []
     for _, _, ids in chunks:
         all_msg_ids.extend(ids)
 
-    # Sirf clients ki list (slot order mein)
     clients = [(slot, client) for slot, client, _ in chunks]
     n = len(clients)
 
+    MIN_DELAY    = 0.3
+    BASE_DELAY   = 0.5
+    MAX_DELAY    = 2.0
+    BATCH_SIZE   = 5
+    BATCH_PAUSE  = 0.5
+    PROGRESS_EVERY = 20
+
+    # Per-account adaptive state
+    acc_state = {
+        slot: {"delay": BASE_DELAY, "flood_until": 0, "streak": 0}
+        for slot, _ in clients
+    }
+
     done = skipped = filtered = 0
-    idx  = 0          # queue pointer
-    turn = 0          # round-robin turn (0 → n-1)
-    PROGRESS_EVERY = 15
+    idx  = 0
+    turn = 0
 
     while idx < len(all_msg_ids):
-        # Cancel check
         if _active.get(master_id, {}).get("cancelled"):
             await _edit_safe(status_msg,
-                f"🛑 **Stopped!**\n\n"
-                f"✅ Forwarded: {done}\n"
-                f"⏭ Skipped: {skipped}\n"
-                f"🔽 Filtered: {filtered}\n"
-                f"📊 Checked: {done + skipped + filtered} / {total}"
+                f"\U0001f6d1 **Stopped!**\n\n"
+                f"\u2705 Forwarded: {done}\n"
+                f"\u23ed Skipped: {skipped}\n"
+                f"\U0001f53d Filtered: {filtered}\n"
+                f"\U0001f4ca Checked: {done + skipped + filtered} / {total}"
             )
             _active.pop(master_id, None)
             _user_task.pop(owner_id, None)
             return
 
-        slot, client = clients[turn % n]
-        msg_id       = all_msg_ids[idx]
+        # Flood mein hone wale accounts ko skip karo
+        attempts = 0
+        while attempts < n:
+            slot, client = clients[turn % n]
+            if time.time() >= acc_state[slot]["flood_until"]:
+                break
+            turn += 1
+            attempts += 1
+        else:
+            min_wait = min(
+                max(0, acc_state[s]["flood_until"] - time.time())
+                for s, _ in clients
+            )
+            await _edit_safe(status_msg,
+                f"\u23f3 **Saare accounts FloodWait mein...**\n"
+                f"Resume in {int(min_wait)}s\n\n"
+                f"\u2705 {done} | \u23ed {skipped} | \U0001f53d {filtered}\n/stop — cancel"
+            )
+            await asyncio.sleep(max(1, min_wait))
+            continue
+
+        msg_id = all_msg_ids[idx]
+        state  = acc_state[slot]
 
         result = await _forward_one(
             client, source, target, msg_id,
@@ -638,56 +676,61 @@ async def _run_multi_forward(
         )
 
         if result.startswith("flood:"):
-            # Is account ko wait karwa do, baaki accounts se continue karo
             wait_sec = int(result.split(":")[1])
+            state["flood_until"] = time.time() + wait_sec
+            state["delay"] = min(MAX_DELAY, state["delay"] + 0.3)
+            state["streak"] = 0
             await _edit_safe(status_msg,
-                f"⏳ Account {slot} FloodWait {wait_sec}s...\n"
-                f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n\n"
-                f"/stop — cancel"
+                f"\u26a0\ufe0f Account {slot} FloodWait {wait_sec}s — dusre accounts se continue\n"
+                f"\u2705 {done} | \u23ed {skipped} | \U0001f53d {filtered}\n/stop — cancel"
             )
-            await asyncio.sleep(wait_sec)
-            # Same message retry karega, turn same rakhenge
+            turn += 1
             continue
+
         elif result == "done":
             done += 1
+            state["streak"] += 1
+            if state["streak"] >= 3:
+                state["delay"] = max(MIN_DELAY, state["delay"] - 0.05)
+                state["streak"] = 0
         elif result == "filter":
             filtered += 1
+            state["streak"] = 0
         else:
             skipped += 1
+            state["streak"] = 0
 
         idx  += 1
         turn += 1
 
-        # Progress update
         processed = done + skipped + filtered
         if processed % PROGRESS_EVERY == 0 and processed > 0:
             pct = int(processed / total * 100)
-            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            acc_turn = clients[turn % n][0]
+            bar = "\u2588" * (pct // 10) + "\u2591" * (10 - pct // 10)
+            avg_delay = sum(s["delay"] for s in acc_state.values()) / n
             await _edit_safe(status_msg,
-                f"📤 **Forwarding... (Round-Robin)**\n"
+                f"\U0001f4e4 **Forwarding... (Smart Round-Robin)**\n"
                 f"{bar} {pct}%\n"
-                f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n"
-                f"🔄 Next: Account {acc_turn}\n\n"
+                f"\u2705 {done} | \u23ed {skipped} | \U0001f53d {filtered}\n"
+                f"\u26a1 Speed: {avg_delay:.2f}s/msg/account\n\n"
                 f"/stop — cancel"
             )
 
-        # 1 second delay — har message ke baad
-        # Matlab har account ko effectively (n × 1s) rest milta hai
-        await asyncio.sleep(1)
+        await asyncio.sleep(state["delay"])
 
-    # Done!
+        if idx % BATCH_SIZE == 0:
+            await asyncio.sleep(BATCH_PAUSE)
+
     await _edit_safe(status_msg,
-        f"🎉 **Done!**\n\n"
-        f"✅ Forwarded: {done}\n"
-        f"⏭ Skipped (deleted/empty): {skipped}\n"
-        f"🔽 Filtered (type): {filtered}\n"
-        f"📊 Total checked: {total}\n"
-        f"👥 Accounts used: {n} (Round-Robin)"
+        f"\U0001f389 **Done!**\n\n"
+        f"\u2705 Forwarded: {done}\n"
+        f"\u23ed Skipped (deleted/empty): {skipped}\n"
+        f"\U0001f53d Filtered (type): {filtered}\n"
+        f"\U0001f4ca Total checked: {total}\n"
+        f"\U0001f465 Accounts used: {n} (Smart Round-Robin)"
     )
     _active.pop(master_id, None)
     _user_task.pop(owner_id, None)
-
 
 async def _edit_safe(message, text: str):
     try:
