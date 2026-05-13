@@ -306,10 +306,87 @@ async def _handle_target(bot, msg: Message, owner_id: int, state: dict):
     state["hide_links"] = False
     state["hide_usernames"] = False
     state["selected_types"] = set(ALL_TYPES)
-    state["step"] = "hide_opts"
+    state["step"] = "mode_select"
 
-    # Summary + Hide options
-    await _show_hide_opts(msg, owner_id)
+    # Mode select: Bot ya Userbot
+    await _show_mode_select(msg, owner_id)
+
+
+# ═══════════════════════ MODE SELECT UI ══════════════════════════════════
+
+async def _show_mode_select(target, owner_id: int):
+    """Bot mode ya Userbot mode — user choose kare."""
+    state = FORWARD_STATE.get(owner_id, {})
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🤖 Bot se Forward",    callback_data=f"fwd_mode#{owner_id}#bot"),
+            InlineKeyboardButton("👤 Userbot se Forward", callback_data=f"fwd_mode#{owner_id}#userbot"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"fwd_cancel#{owner_id}")]
+    ])
+    text = (
+        f"📋 **Forward Summary**\n\n"
+        f"• 📥 Source: `{state.get('src_name')}` (`{state.get('source_id')}`)\n"
+        f"• 📤 Target: `{state.get('tgt_name')}` (`{state.get('target_id')}`)\n"
+        f"• 🔢 Range: `{state.get('start_id')}` → `{state.get('end_id')}` "
+        f"({state.get('total')} msgs)\n\n"
+        f"**Forwarding mode choose karo:**\n\n"
+        f"🤖 **Bot se** — Bot ko source+target dono mein admin banana hoga\n"
+        f"👤 **Userbot se** — Logged-in account se forward hoga (current behavior)"
+    )
+    is_bot_msg = hasattr(target, 'edit_text') and getattr(target, 'from_user', None) is None
+    if is_bot_msg:
+        try:
+            await target.edit_text(text, reply_markup=buttons)
+            return
+        except Exception:
+            pass
+    await target.reply(text, reply_markup=buttons)
+
+
+@Client.on_callback_query(filters.regex(r"^fwd_mode#"))
+async def cb_fwd_mode(bot: Client, query: CallbackQuery):
+    parts    = query.data.split("#")
+    owner_id = int(parts[1])
+    mode     = parts[2]   # "bot" or "userbot"
+
+    if query.from_user.id != owner_id:
+        return await query.answer("Yeh tumhara button nahi.", show_alert=True)
+
+    state = FORWARD_STATE.get(owner_id)
+    if not state:
+        return await query.message.edit_text("❌ Session expire ho gaya. /forward dobara karo.")
+
+    if mode == "bot":
+        # Bot mode: pehle admin check karo
+        source = state["source_id"]
+        target_ch = state["target_id"]
+        errors = []
+        try:
+            src_member = await bot.get_chat_member(source, (await bot.get_me()).id)
+            if src_member.status.value not in ("administrator", "creator"):
+                errors.append(f"❌ Source mein bot **admin nahi** hai")
+        except Exception:
+            errors.append(f"⚠️ Source channel check nahi ho saka — public hai toh theek hai")
+        try:
+            tgt_member = await bot.get_chat_member(target_ch, (await bot.get_me()).id)
+            if tgt_member.status.value not in ("administrator", "creator"):
+                errors.append(f"❌ Target mein bot **admin nahi** hai")
+        except Exception:
+            errors.append(f"❌ Target channel check nahi ho saka — admin banana zaroori hai")
+
+        if any("❌" in e for e in errors):
+            warn = "\n".join(errors)
+            return await query.message.edit_text(
+                f"🤖 **Bot Mode — Admin Check Failed**\n\n"
+                f"{warn}\n\n"
+                f"Bot ko dono channels mein admin banao, phir /forward dobara karo."
+            )
+
+    state["forward_mode"] = mode
+    state["step"] = "hide_opts"
+    await query.answer()
+    await _show_hide_opts(query.message, owner_id)
 
 
 # ═══════════════════════ HIDE OPTIONS UI ═════════════════════════════════
@@ -461,37 +538,41 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
         FORWARD_STATE[owner_id] = state
         return await query.answer("❌ Kum se kum ek type select karo!", show_alert=True)
 
-    # ── Saare available accounts lo ───────────────────────────────────
-    all_acc = await get_all_clients(owner_id)
-    if not all_acc:
-        return await query.message.edit_text(
-            "❌ Koi account login nahi hai.\n/addaccount se pehle login karo."
-        )
-
-    source   = state["source_id"]
-    target   = state["target_id"]
-    start_id = state["start_id"]
-    end_id   = state["end_id"]
-    total    = state["total"]
-    hide_lnk = state.get("hide_links", False)
-    hide_usr = state.get("hide_usernames", False)
+    source      = state["source_id"]
+    target      = state["target_id"]
+    start_id    = state["start_id"]
+    end_id      = state["end_id"]
+    total       = state["total"]
+    hide_lnk    = state.get("hide_links", False)
+    hide_usr    = state.get("hide_usernames", False)
+    forward_mode = state.get("forward_mode", "userbot")
     type_labels = [k for k, v in MEDIA_TYPES.items() if v in selected]
     type_str = ", ".join(type_labels) if len(type_labels) < len(MEDIA_TYPES) else "All"
 
-    n_acc = len(all_acc)
-
-    # ── Range ko accounts mein divide karo ───────────────────────────
-    # Example: 3 accounts, 900 msgs → each 300
-    # [start → start+299], [start+300 → start+599], [start+600 → end]
-    all_ids    = list(range(start_id, end_id + 1))
-    chunk_size = max(1, len(all_ids) // n_acc)
-    chunks     = []
-    for i, (slot, _) in enumerate(all_acc):
-        s = i * chunk_size
-        e = s + chunk_size if i < n_acc - 1 else len(all_ids)
-        chunk = all_ids[s:e]
-        if chunk:
-            chunks.append((slot, all_acc[i][1], chunk))
+    # ── Mode ke hisaab se clients decide karo ────────────────────────
+    if forward_mode == "bot":
+        # Bot khud ek client hai — slot 0 ke roop mein treat karo
+        chunks = [(0, bot, list(range(start_id, end_id + 1)))]
+        n_acc  = 1
+        mode_label = "🤖 Bot"
+    else:
+        # Userbot mode — saare logged-in accounts
+        all_acc = await get_all_clients(owner_id)
+        if not all_acc:
+            return await query.message.edit_text(
+                "❌ Koi account login nahi hai.\n/addaccount se pehle login karo."
+            )
+        n_acc  = len(all_acc)
+        all_ids    = list(range(start_id, end_id + 1))
+        chunk_size = max(1, len(all_ids) // n_acc)
+        chunks     = []
+        for i, (slot, _) in enumerate(all_acc):
+            s = i * chunk_size
+            e = s + chunk_size if i < n_acc - 1 else len(all_ids)
+            chunk = all_ids[s:e]
+            if chunk:
+                chunks.append((slot, all_acc[i][1], chunk))
+        mode_label = f"👤 Userbot ({n_acc} account)"
 
     # ── Master task ID ────────────────────────────────────────────────
     master_id = str(uuid.uuid4())[:8]
@@ -499,20 +580,20 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
     _user_task[owner_id] = master_id
 
     acc_info = "\n".join(
-        f"  Account {slot}: msg {chunk[0]}→{chunk[-1]} ({len(chunk)} msgs)"
+        f"  Slot {slot}: msg {chunk[0]}→{chunk[-1]} ({len(chunk)} msgs)"
         for slot, _, chunk in chunks
     )
 
     status_msg = await query.message.edit_text(
         f"⏳ **Forwarding shuru...**\n"
         f"Task: `{master_id}`\n"
+        f"Mode: {mode_label}\n"
         f"Types: {type_str}\n"
-        f"📊 {n_acc} account(s) kaam karengy:\n"
+        f"📊 Distribution:\n"
         f"{acc_info}\n\n"
         f"/stop — forward band karo"
     )
 
-    # ── Saare chunks parallel mein launch karo ────────────────────────
     asyncio.create_task(
         _run_multi_forward(
             master_id, owner_id, chunks, source, target,
@@ -597,78 +678,40 @@ async def _run_multi_forward(
     sel_types, hide_lnk, hide_usr, total, status_msg
 ):
     """
-    Smart Adaptive Round-Robin forwarding.
-
-    Strategy (ban-safe + fast):
-    - Base delay: 0.5s per message per account
-    - Har account ko effectively (n x 0.5s) rest milta hai
-    - Agar 3 consecutive successes -> delay thoda kam (min 0.3s)
-    - Agar FloodWait aaye -> delay temporarily badh jaata hai
-    - Agar koi account flood ho -> woh skip, baaki continue karte hain
-    - Batch mode: har 5 messages ke baad 0.5s extra pause
+    Round-Robin forwarding:
+    Saare messages ek queue mein hain.
+    Accounts baari baari ek-ek message lete hain.
     """
-    import time
-
+    # Saari IDs ek flat queue mein
     all_msg_ids = []
     for _, _, ids in chunks:
         all_msg_ids.extend(ids)
 
+    # Sirf clients ki list (slot order mein)
     clients = [(slot, client) for slot, client, _ in chunks]
     n = len(clients)
 
-    MIN_DELAY    = 0.3
-    BASE_DELAY   = 0.5
-    MAX_DELAY    = 2.0
-    BATCH_SIZE   = 5
-    BATCH_PAUSE  = 0.5
-    PROGRESS_EVERY = 20
-
-    # Per-account adaptive state
-    acc_state = {
-        slot: {"delay": BASE_DELAY, "flood_until": 0, "streak": 0}
-        for slot, _ in clients
-    }
-
     done = skipped = filtered = 0
-    idx  = 0
-    turn = 0
+    idx  = 0          # queue pointer
+    turn = 0          # round-robin turn (0 → n-1)
+    PROGRESS_EVERY = 15
 
     while idx < len(all_msg_ids):
+        # Cancel check
         if _active.get(master_id, {}).get("cancelled"):
             await _edit_safe(status_msg,
-                f"\U0001f6d1 **Stopped!**\n\n"
-                f"\u2705 Forwarded: {done}\n"
-                f"\u23ed Skipped: {skipped}\n"
-                f"\U0001f53d Filtered: {filtered}\n"
-                f"\U0001f4ca Checked: {done + skipped + filtered} / {total}"
+                f"🛑 **Stopped!**\n\n"
+                f"✅ Forwarded: {done}\n"
+                f"⏭ Skipped: {skipped}\n"
+                f"🔽 Filtered: {filtered}\n"
+                f"📊 Checked: {done + skipped + filtered} / {total}"
             )
             _active.pop(master_id, None)
             _user_task.pop(owner_id, None)
             return
 
-        # Flood mein hone wale accounts ko skip karo
-        attempts = 0
-        while attempts < n:
-            slot, client = clients[turn % n]
-            if time.time() >= acc_state[slot]["flood_until"]:
-                break
-            turn += 1
-            attempts += 1
-        else:
-            min_wait = min(
-                max(0, acc_state[s]["flood_until"] - time.time())
-                for s, _ in clients
-            )
-            await _edit_safe(status_msg,
-                f"\u23f3 **Saare accounts FloodWait mein...**\n"
-                f"Resume in {int(min_wait)}s\n\n"
-                f"\u2705 {done} | \u23ed {skipped} | \U0001f53d {filtered}\n/stop — cancel"
-            )
-            await asyncio.sleep(max(1, min_wait))
-            continue
-
-        msg_id = all_msg_ids[idx]
-        state  = acc_state[slot]
+        slot, client = clients[turn % n]
+        msg_id       = all_msg_ids[idx]
 
         result = await _forward_one(
             client, source, target, msg_id,
@@ -676,61 +719,56 @@ async def _run_multi_forward(
         )
 
         if result.startswith("flood:"):
+            # Is account ko wait karwa do, baaki accounts se continue karo
             wait_sec = int(result.split(":")[1])
-            state["flood_until"] = time.time() + wait_sec
-            state["delay"] = min(MAX_DELAY, state["delay"] + 0.3)
-            state["streak"] = 0
             await _edit_safe(status_msg,
-                f"\u26a0\ufe0f Account {slot} FloodWait {wait_sec}s — dusre accounts se continue\n"
-                f"\u2705 {done} | \u23ed {skipped} | \U0001f53d {filtered}\n/stop — cancel"
+                f"⏳ Account {slot} FloodWait {wait_sec}s...\n"
+                f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n\n"
+                f"/stop — cancel"
             )
-            turn += 1
+            await asyncio.sleep(wait_sec)
+            # Same message retry karega, turn same rakhenge
             continue
-
         elif result == "done":
             done += 1
-            state["streak"] += 1
-            if state["streak"] >= 3:
-                state["delay"] = max(MIN_DELAY, state["delay"] - 0.05)
-                state["streak"] = 0
         elif result == "filter":
             filtered += 1
-            state["streak"] = 0
         else:
             skipped += 1
-            state["streak"] = 0
 
         idx  += 1
         turn += 1
 
+        # Progress update
         processed = done + skipped + filtered
         if processed % PROGRESS_EVERY == 0 and processed > 0:
             pct = int(processed / total * 100)
-            bar = "\u2588" * (pct // 10) + "\u2591" * (10 - pct // 10)
-            avg_delay = sum(s["delay"] for s in acc_state.values()) / n
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            acc_turn = clients[turn % n][0]
             await _edit_safe(status_msg,
-                f"\U0001f4e4 **Forwarding... (Smart Round-Robin)**\n"
+                f"📤 **Forwarding... (Round-Robin)**\n"
                 f"{bar} {pct}%\n"
-                f"\u2705 {done} | \u23ed {skipped} | \U0001f53d {filtered}\n"
-                f"\u26a1 Speed: {avg_delay:.2f}s/msg/account\n\n"
+                f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n"
+                f"🔄 Next: Account {acc_turn}\n\n"
                 f"/stop — cancel"
             )
 
-        await asyncio.sleep(state["delay"])
+        # 1 second delay — har message ke baad
+        # Matlab har account ko effectively (n × 1s) rest milta hai
+        await asyncio.sleep(1)
 
-        if idx % BATCH_SIZE == 0:
-            await asyncio.sleep(BATCH_PAUSE)
-
+    # Done!
     await _edit_safe(status_msg,
-        f"\U0001f389 **Done!**\n\n"
-        f"\u2705 Forwarded: {done}\n"
-        f"\u23ed Skipped (deleted/empty): {skipped}\n"
-        f"\U0001f53d Filtered (type): {filtered}\n"
-        f"\U0001f4ca Total checked: {total}\n"
-        f"\U0001f465 Accounts used: {n} (Smart Round-Robin)"
+        f"🎉 **Done!**\n\n"
+        f"✅ Forwarded: {done}\n"
+        f"⏭ Skipped (deleted/empty): {skipped}\n"
+        f"🔽 Filtered (type): {filtered}\n"
+        f"📊 Total checked: {total}\n"
+        f"👥 Accounts used: {n} (Round-Robin)"
     )
     _active.pop(master_id, None)
     _user_task.pop(owner_id, None)
+
 
 async def _edit_safe(message, text: str):
     try:
