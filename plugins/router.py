@@ -7,7 +7,7 @@ from state_router import active_state
 
 
 @Client.on_message(filters.private & ~filters.command(
-    ["start", "login", "logout", "auto", "rules", "forward"]
+    ["start", "login", "logout", "auto", "rules", "forward", "stop"]
 ), group=1)
 async def route_message(bot: Client, msg: Message):
     owner_id = msg.from_user.id

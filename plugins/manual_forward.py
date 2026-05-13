@@ -1,46 +1,125 @@
 """
-/forward <source_id> <start_id> <end_id> <target_id>
-
-Example:
-  /forward -1002341494850 102 1898 -1001973147493
+/forward — Step-by-step interactive forward wizard
 
 Flow:
-  1. Command parse → confirm summary
-  2. Hide links / Hide @username toggle
-  3. Media type filter (multi-select)
-  4. Start forwarding with delay + batch break
+  Step 1: /forward type karo
+          → Bot: "Source channel ka ID ya ek message forward karo"
+  Step 2: User source deta hai (ID ya forwarded msg)
+          → Bot: "Start karne ki jagah ka link do"
+  Step 3: User start link deta hai
+          → Bot: "Kahan tak forward karna hai — end link do"
+  Step 4: User end link deta hai
+          → Bot: "Target channel ka ID ya ek message forward karo"
+  Step 5: User target deta hai
+          → Bot: Hide options + Media type selector (inline buttons)
+  Step 6: Start Forward → forwarding shuru
+          /stop → kisi bhi waqt cancel
+
+Cancel:
+  /stop — active forward ya wizard dono band kar deta hai
 """
+
 import asyncio
 import re
 import uuid
+
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 from pyrogram.errors import FloodWait, MessageIdInvalid
+
 from userbot import get_client
 from database import db
 from state_router import FORWARD_STATE, clear_all
 from utils import process_text
 
-_active: dict[str, dict] = {}
 
-# Media type label → pyrogram message attribute
+# ──────────────────────── active tasks ───────────────────────────────────
+_active: dict[str, dict] = {}          # task_id → {cancelled: bool}
+_user_task: dict[int, str] = {}        # owner_id → task_id  (for /stop)
+
+# ──────────────────────── media types ────────────────────────────────────
 MEDIA_TYPES = {
-    "📝 Text":      "text",
-    "🖼 Photo":     "photo",
-    "🎬 Video":     "video",
-    "🎵 Audio":     "audio",
-    "🎤 Voice":     "voice",
-    "📄 Document":  "document",
-    "😂 Sticker":   "sticker",
-    "🌀 GIF":       "animation",
-    "📹 Video Note":"video_note",
+    "📝 Text":       "text",
+    "🖼 Photo":      "photo",
+    "🎬 Video":      "video",
+    "🎵 Audio":      "audio",
+    "🎤 Voice":      "voice",
+    "📄 Document":   "document",
+    "😂 Sticker":    "sticker",
+    "🌀 GIF":        "animation",
+    "📹 Video Note": "video_note",
 }
 ALL_TYPES = list(MEDIA_TYPES.values())
 
 
-# ─────────────────────────── /forward command ────────────────────────────
+# ═══════════════════════ HELPER: parse channel info ══════════════════════
+
+def _extract_msg_link_ids(text: str):
+    """
+    Telegram message link se channel_id aur message_id nikalo.
+    Supported formats:
+      https://t.me/c/1234567890/55
+      https://t.me/username/55
+    Returns (channel_identifier, message_id) or (None, None)
+    """
+    m = re.search(r't\.me/c/(\d+)/(\d+)', text)
+    if m:
+        return int("-100" + m.group(1)), int(m.group(2))
+    m = re.search(r't\.me/([A-Za-z0-9_]+)/(\d+)', text)
+    if m:
+        return m.group(1), int(m.group(2))
+    return None, None
+
+
+async def _resolve_channel(client, value: str | int):
+    """
+    Channel ka title fetch karo. Value ho sakta hai:
+      - integer ID
+      - @username string
+    Returns (resolved_id, title) or raises Exception
+    """
+    chat = await client.get_chat(value)
+    return chat.id, (chat.title or chat.username or str(chat.id))
+
+
+# ═══════════════════════ STEP MESSAGES ═══════════════════════════════════
+
+STEP_TEXTS = {
+    "ask_source": (
+        "📥 **Step 1/4 — Source Channel**\n\n"
+        "Jis channel *se* forward karna hai uska:\n"
+        "• Channel ID do  _(e.g. `-1001234567890`)_\n"
+        "  **ya**\n"
+        "• Uss channel ka koi ek message yahan forward karo\n\n"
+        "_/stop — cancel_"
+    ),
+    "ask_start": (
+        "🔗 **Step 2/4 — Start Message**\n\n"
+        "Jahan *se* forward shuru karna hai us message ka link do.\n"
+        "_(Right-click → Copy Link)_\n\n"
+        "Example: `https://t.me/c/1234567890/100`\n\n"
+        "_/stop — cancel_"
+    ),
+    "ask_end": (
+        "🔗 **Step 3/4 — End Message**\n\n"
+        "Jahan *tak* forward karna hai us message ka link do.\n\n"
+        "Example: `https://t.me/c/1234567890/500`\n\n"
+        "_/stop — cancel_"
+    ),
+    "ask_target": (
+        "📤 **Step 4/4 — Target Channel**\n\n"
+        "Jis channel *mein* forward karna hai uska:\n"
+        "• Channel ID do  _(e.g. `-1001234567890`)_\n"
+        "  **ya**\n"
+        "• Uss channel ka koi ek message yahan forward karo\n\n"
+        "_/stop — cancel_"
+    ),
+}
+
+
+# ═══════════════════════ /forward COMMAND ════════════════════════════════
 
 @Client.on_message(filters.private & filters.command("forward"))
 async def cmd_forward(bot: Client, msg: Message):
@@ -51,84 +130,198 @@ async def cmd_forward(bot: Client, msg: Message):
     if not client:
         return await msg.reply("❌ Pehle userbot login karo: /login")
 
-    # msg.text se manually parse — msg.command negative IDs galat split karta hai
-    raw_text = (msg.text or "").strip()
-    parts = raw_text.split()
-    args = parts[1:]  # /forward hatao
+    # Koi purana state clear karo
+    clear_all(owner_id)
 
-    # ── Args validate ────────────────────────────────────────
-    if len(args) != 4:
+    # Agar koi task chal raha hai toh cancel karo
+    old_task = _user_task.pop(owner_id, None)
+    if old_task and old_task in _active:
+        _active[old_task]["cancelled"] = True
+
+    # Naya wizard state shuru karo
+    FORWARD_STATE[owner_id] = {"step": "ask_source"}
+
+    await msg.reply(STEP_TEXTS["ask_source"])
+
+
+# ═══════════════════════ /stop COMMAND ═══════════════════════════════════
+
+@Client.on_message(filters.private & filters.command("stop"))
+async def cmd_stop(bot: Client, msg: Message):
+    owner_id = msg.from_user.id
+
+    # Wizard cancel
+    if owner_id in FORWARD_STATE:
+        FORWARD_STATE.pop(owner_id, None)
+        await msg.reply("🛑 Forward wizard cancel ho gaya.")
+        return
+
+    # Active task cancel
+    task_id = _user_task.pop(owner_id, None)
+    if task_id and task_id in _active:
+        _active[task_id]["cancelled"] = True
+        await msg.reply(f"🛑 Forward task cancel ho raha hai...")
+    else:
+        await msg.reply("ℹ️ Abhi koi active forward ya wizard nahi hai.")
+
+
+# ═══════════════════════ WIZARD STEP HANDLER ═════════════════════════════
+
+async def handle_forward_step(bot: Client, msg: Message):
+    """router.py yahan bhejta hai jab FORWARD_STATE active ho."""
+    owner_id = msg.from_user.id
+    state = FORWARD_STATE.get(owner_id)
+    if not state:
+        return
+
+    step = state.get("step")
+
+    # ── Step 1: Source channel ───────────────────────────────────────────
+    if step == "ask_source":
+        await _handle_source(bot, msg, owner_id, state)
+
+    # ── Step 2: Start link ───────────────────────────────────────────────
+    elif step == "ask_start":
+        await _handle_start(bot, msg, owner_id, state)
+
+    # ── Step 3: End link ─────────────────────────────────────────────────
+    elif step == "ask_end":
+        await _handle_end(bot, msg, owner_id, state)
+
+    # ── Step 4: Target channel ───────────────────────────────────────────
+    elif step == "ask_target":
+        await _handle_target(bot, msg, owner_id, state)
+
+
+# ──────────────────── Individual step handlers ───────────────────────────
+
+async def _handle_source(bot, msg: Message, owner_id: int, state: dict):
+    client = await get_client(owner_id)
+
+    # Forwarded message se source nikalo
+    if msg.forward_from_chat:
+        src_id = msg.forward_from_chat.id
+        src_name = msg.forward_from_chat.title or str(src_id)
+    else:
+        # Text ID ya username
+        text = (msg.text or "").strip()
+        if not text.lstrip("-").isdigit() and not text.startswith("@"):
+            return await msg.reply(
+                "❌ Samajh nahi aaya.\n\n"
+                "Channel ID do _(e.g. `-1001234567890`)_ **ya** uss channel ka koi message forward karo.\n\n"
+                "_/stop — cancel_"
+            )
+        try:
+            val = int(text) if text.lstrip("-").isdigit() else text
+            src_id, src_name = await _resolve_channel(client, val)
+        except Exception:
+            return await msg.reply(
+                "❌ Channel nahi mila. Sahi ID/username do ya message forward karo.\n\n_/stop — cancel_"
+            )
+
+    state["source_id"] = src_id
+    state["src_name"] = src_name
+    state["step"] = "ask_start"
+    await msg.reply(
+        f"✅ Source set: **{src_name}** (`{src_id}`)\n\n" + STEP_TEXTS["ask_start"]
+    )
+
+
+async def _handle_start(bot, msg: Message, owner_id: int, state: dict):
+    text = (msg.text or "").strip()
+    channel_hint, msg_id = _extract_msg_link_ids(text)
+
+    if msg_id is None:
         return await msg.reply(
-            "❌ **Format galat hai!**\n\n"
-            "✅ Sahi format:\n"
-            "`/forward <source_id> <start> <end> <target_id>`\n\n"
-            "**Example:**\n"
-            "`/forward -1002341494850 102 1898 -1001973147493`\n\n"
-            "• `source_id` — jahan se forward karna hai\n"
-            "• `start` — pehla message number\n"
-            "• `end` — aakhri message number\n"
-            "• `target_id` — jahan forward karna hai"
+            "❌ Valid message link nahi mila.\n\n"
+            "Example: `https://t.me/c/1234567890/100`\n\n"
+            "_/stop — cancel_"
         )
 
-    source_raw, start_raw, end_raw, target_raw = args
+    # Source se match karo agar link mein channel hai
+    src_id = state["source_id"]
+    if channel_hint is not None:
+        # Sirf message_id use karo, source already set hai
+        pass
 
-    # Validate numbers
-    for val, name in [(source_raw, "source_id"), (start_raw, "start"),
-                      (end_raw, "end"), (target_raw, "target_id")]:
-        if not val.lstrip("-").isdigit():
-            return await msg.reply(f"❌ `{name}` valid number nahi hai: `{val}`")
-
-    source_id = int(source_raw)
-    start_id  = int(start_raw)
-    end_id    = int(end_raw)
-    target_id = int(target_raw)
-
-    if start_id > end_id:
-        return await msg.reply(f"❌ Start (`{start_id}`) end (`{end_id}`) se bada hai!")
-
-    # Channel names fetch karo
-    try:
-        src_chat = await client.get_chat(source_id)
-        src_name = src_chat.title or str(source_id)
-    except Exception:
-        src_name = str(source_id)
-
-    try:
-        tgt_chat = await client.get_chat(target_id)
-        tgt_name = tgt_chat.title or str(target_id)
-    except Exception:
-        tgt_name = str(target_id)
-
-    total = end_id - start_id + 1
-
-    # State save karo
-    clear_all(owner_id)
-    FORWARD_STATE[owner_id] = {
-        "step"           : "hide_opts",
-        "source_id"      : source_id,
-        "target_id"      : target_id,
-        "start_id"       : start_id,
-        "end_id"         : end_id,
-        "src_name"       : src_name,
-        "tgt_name"       : tgt_name,
-        "total"          : total,
-        "hide_links"     : False,
-        "hide_usernames" : False,
-        "selected_types" : set(ALL_TYPES),
-    }
-
-    # Step 1: Hide options
-    await _show_hide_opts(msg, owner_id, src_name, tgt_name, start_id, end_id, total)
+    state["start_id"] = msg_id
+    state["step"] = "ask_end"
+    await msg.reply(
+        f"✅ Start message ID set: `{msg_id}`\n\n" + STEP_TEXTS["ask_end"]
+    )
 
 
-async def _show_hide_opts(target, owner_id, src_name, tgt_name, start_id, end_id, total):
+async def _handle_end(bot, msg: Message, owner_id: int, state: dict):
+    text = (msg.text or "").strip()
+    _, msg_id = _extract_msg_link_ids(text)
+
+    if msg_id is None:
+        return await msg.reply(
+            "❌ Valid message link nahi mila.\n\n"
+            "Example: `https://t.me/c/1234567890/500`\n\n"
+            "_/stop — cancel_"
+        )
+
+    start_id = state["start_id"]
+    if msg_id < start_id:
+        return await msg.reply(
+            f"❌ End ID (`{msg_id}`) start ID (`{start_id}`) se chhota hai!\n\n"
+            "Sahi end link do.\n\n_/stop — cancel_"
+        )
+
+    state["end_id"] = msg_id
+    state["total"] = msg_id - start_id + 1
+    state["step"] = "ask_target"
+    await msg.reply(
+        f"✅ End message ID set: `{msg_id}` _(total: {state['total']} messages)_\n\n"
+        + STEP_TEXTS["ask_target"]
+    )
+
+
+async def _handle_target(bot, msg: Message, owner_id: int, state: dict):
+    client = await get_client(owner_id)
+
+    # Forwarded message se target nikalo
+    if msg.forward_from_chat:
+        tgt_id = msg.forward_from_chat.id
+        tgt_name = msg.forward_from_chat.title or str(tgt_id)
+    else:
+        text = (msg.text or "").strip()
+        if not text.lstrip("-").isdigit() and not text.startswith("@"):
+            return await msg.reply(
+                "❌ Samajh nahi aaya.\n\n"
+                "Channel ID do _(e.g. `-1001234567890`)_ **ya** uss channel ka koi message forward karo.\n\n"
+                "_/stop — cancel_"
+            )
+        try:
+            val = int(text) if text.lstrip("-").isdigit() else text
+            tgt_id, tgt_name = await _resolve_channel(client, val)
+        except Exception:
+            return await msg.reply(
+                "❌ Channel nahi mila. Sahi ID/username do ya message forward karo.\n\n_/stop — cancel_"
+            )
+
+    state["target_id"] = tgt_id
+    state["tgt_name"] = tgt_name
+    state["hide_links"] = False
+    state["hide_usernames"] = False
+    state["selected_types"] = set(ALL_TYPES)
+    state["step"] = "hide_opts"
+
+    # Summary + Hide options
+    await _show_hide_opts(msg, owner_id)
+
+
+# ═══════════════════════ HIDE OPTIONS UI ═════════════════════════════════
+
+async def _show_hide_opts(target, owner_id: int):
     state = FORWARD_STATE.get(owner_id, {})
     hl = "✅ ON" if state.get("hide_links") else "OFF"
     hu = "✅ ON" if state.get("hide_usernames") else "OFF"
 
     buttons = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"🔗 Hide Links: {hl}",   callback_data=f"fwd_hide#{owner_id}#hide_links"),
+            InlineKeyboardButton(f"🔗 Hide Links: {hl}",  callback_data=f"fwd_hide#{owner_id}#hide_links"),
             InlineKeyboardButton(f"👤 Hide @user: {hu}", callback_data=f"fwd_hide#{owner_id}#hide_usernames"),
         ],
         [InlineKeyboardButton("➡️ Next: Media Types", callback_data=f"fwd_hide#{owner_id}#done")],
@@ -137,10 +330,11 @@ async def _show_hide_opts(target, owner_id, src_name, tgt_name, start_id, end_id
 
     text = (
         f"📋 **Forward Summary**\n\n"
-        f"• 📥 Source: `{src_name}`\n"
-        f"• 📤 Target: `{tgt_name}`\n"
-        f"• 🔢 Range: `{start_id}` → `{end_id}` ({total} msgs)\n\n"
-        f"**Step 1/2 — Hide options choose karo:**"
+        f"• 📥 Source: `{state.get('src_name')}` (`{state.get('source_id')}`)\n"
+        f"• 📤 Target: `{state.get('tgt_name')}` (`{state.get('target_id')}`)\n"
+        f"• 🔢 Range: `{state.get('start_id')}` → `{state.get('end_id')}` "
+        f"({state.get('total')} msgs)\n\n"
+        f"**Step — Hide options choose karo:**"
     )
 
     if hasattr(target, 'edit_text'):
@@ -149,7 +343,7 @@ async def _show_hide_opts(target, owner_id, src_name, tgt_name, start_id, end_id
         await target.reply(text, reply_markup=buttons)
 
 
-# ─────────────────────── Hide options callback ───────────────────────────
+# ─────────────────── Hide options callback ───────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fwd_hide#"))
 async def cb_fwd_hide(bot: Client, query: CallbackQuery):
@@ -165,22 +359,18 @@ async def cb_fwd_hide(bot: Client, query: CallbackQuery):
         return await query.message.edit_text("❌ Session expire ho gaya. /forward dobara karo.")
 
     if field == "done":
-        # Step 2: Media type selector
         state["step"] = "pick_types"
         await _show_type_selector(query.message, owner_id)
         return
 
-    # Toggle
     state[field] = not state.get(field, False)
     await query.answer()
-    await _show_hide_opts(
-        query.message, owner_id,
-        state["src_name"], state["tgt_name"],
-        state["start_id"], state["end_id"], state["total"]
-    )
+    await _show_hide_opts(query.message, owner_id)
 
 
-async def _show_type_selector(message, owner_id):
+# ─────────────────── Media type selector ─────────────────────────────────
+
+async def _show_type_selector(message, owner_id: int):
     state    = FORWARD_STATE.get(owner_id, {})
     selected = state.get("selected_types", set(ALL_TYPES))
 
@@ -207,14 +397,12 @@ async def _show_type_selector(message, owner_id):
     hu = "✅" if state.get("hide_usernames") else "❌"
 
     await message.edit_text(
-        f"**Step 2/2 — Kaunse types forward karein?**\n"
+        f"**Kaunse types forward karein?**\n"
         f"_(Untick karo jo skip karna hai)_\n\n"
         f"🔗 Links hidden: {hl}  |  👤 @user hidden: {hu}",
         reply_markup=InlineKeyboardMarkup(rows)
     )
 
-
-# ─────────────────────── Media type callback ─────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fwd_mtype#"))
 async def cb_fwd_mtype(bot: Client, query: CallbackQuery):
@@ -234,17 +422,14 @@ async def cb_fwd_mtype(bot: Client, query: CallbackQuery):
     if mtype == "__all__":
         selected = set(ALL_TYPES) if selected != set(ALL_TYPES) else set()
     else:
-        if mtype in selected:
-            selected.discard(mtype)
-        else:
-            selected.add(mtype)
+        selected.discard(mtype) if mtype in selected else selected.add(mtype)
 
     state["selected_types"] = selected
     await query.answer()
     await _show_type_selector(query.message, owner_id)
 
 
-# ─────────────────────── Cancel callback ─────────────────────────────────
+# ─────────────────── Cancel callback ─────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fwd_cancel#"))
 async def cb_fwd_cancel(bot: Client, query: CallbackQuery):
@@ -253,7 +438,7 @@ async def cb_fwd_cancel(bot: Client, query: CallbackQuery):
     await query.message.edit_text("❌ Forward cancelled.")
 
 
-# ─────────────────────── Start callback ──────────────────────────────────
+# ─────────────────── Start callback ──────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fwd_start#"))
 async def cb_fwd_start(bot: Client, query: CallbackQuery):
@@ -280,6 +465,7 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
     hide_usr = state.get("hide_usernames", False)
 
     _active[task_id] = {"cancelled": False}
+    _user_task[owner_id] = task_id  # /stop ke liye
 
     type_labels = [k for k, v in MEDIA_TYPES.items() if v in selected]
     type_str = ", ".join(type_labels) if len(type_labels) < len(MEDIA_TYPES) else "All"
@@ -289,62 +475,55 @@ async def cb_fwd_start(bot: Client, query: CallbackQuery):
         f"Task ID: `{task_id}`\n"
         f"Types: {type_str}\n"
         f"0 / {total} done\n\n"
-        f"/cancel_{task_id} — stop karo"
+        f"/stop — forward band karo"
     )
 
     client = await get_client(owner_id)
     asyncio.create_task(
         _do_forward(
-            client, task_id, source, target,
-            start_id, end_id, total,
+            client, task_id, owner_id,
+            source, target, start_id, end_id, total,
             list(selected), hide_lnk, hide_usr, status_msg
         )
     )
 
 
-# ─────────────────────── Core forward loop ───────────────────────────────
+# ═══════════════════════ CORE FORWARD LOOP ═══════════════════════════════
 
 def _msg_matches_type(message: Message, selected_types: list) -> bool:
     if not message or message.empty:
         return False
     if "text" in selected_types and message.text and not message.media:
         return True
-    if "photo" in selected_types and message.photo:
-        return True
-    if "video" in selected_types and message.video:
-        return True
-    if "audio" in selected_types and message.audio:
-        return True
-    if "voice" in selected_types and message.voice:
-        return True
-    if "document" in selected_types and message.document:
-        return True
-    if "sticker" in selected_types and message.sticker:
-        return True
-    if "animation" in selected_types and message.animation:
-        return True
-    if "video_note" in selected_types and message.video_note:
-        return True
+    if "photo"      in selected_types and message.photo:      return True
+    if "video"      in selected_types and message.video:      return True
+    if "audio"      in selected_types and message.audio:      return True
+    if "voice"      in selected_types and message.voice:      return True
+    if "document"   in selected_types and message.document:   return True
+    if "sticker"    in selected_types and message.sticker:    return True
+    if "animation"  in selected_types and message.animation:  return True
+    if "video_note" in selected_types and message.video_note: return True
     return False
 
 
 async def _do_forward(
-    client, task_id, source, target,
-    start_id, end_id, total,
+    client, task_id, owner_id,
+    source, target, start_id, end_id, total,
     sel_types, hide_lnk, hide_usr, status_msg
 ):
     done = skipped = filtered = 0
-    BATCH = 15   # har 15 messages pe 3s extra break
+    BATCH = 15
 
     for msg_id in range(start_id, end_id + 1):
         if _active.get(task_id, {}).get("cancelled"):
             await _edit_safe(status_msg,
-                f"🛑 **Cancelled!**\n"
+                f"🛑 **Forward Stopped!**\n\n"
                 f"✅ Forwarded: {done}\n"
                 f"⏭ Skipped: {skipped}\n"
                 f"🔽 Filtered: {filtered}"
             )
             _active.pop(task_id, None)
+            _user_task.pop(owner_id, None)
             return
 
         try:
@@ -384,7 +563,7 @@ async def _do_forward(
             wait = e.value + 2
             await _edit_safe(status_msg,
                 f"⏳ FloodWait {wait}s...\n✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n\n"
-                f"/cancel_{task_id} — stop"
+                f"/stop — cancel"
             )
             await asyncio.sleep(wait)
             try:
@@ -395,18 +574,18 @@ async def _do_forward(
         except Exception:
             skipped += 1
 
-        await asyncio.sleep(1)  # 1s delay per message
+        await asyncio.sleep(1)
 
         processed = done + skipped + filtered
         if processed % BATCH == 0 and processed > 0:
-            await asyncio.sleep(3)  # batch break
+            await asyncio.sleep(3)
             pct = int(processed / total * 100)
             bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
             await _edit_safe(status_msg,
                 f"📤 **Forwarding...**\n"
                 f"{bar} {pct}%\n"
                 f"✅ {done} | ⏭ {skipped} | 🔽 {filtered}\n\n"
-                f"/cancel_{task_id} — stop"
+                f"/stop — cancel"
             )
 
     await _edit_safe(status_msg,
@@ -417,28 +596,13 @@ async def _do_forward(
         f"📊 Total checked: {total}"
     )
     _active.pop(task_id, None)
+    _user_task.pop(owner_id, None)
 
 
-# ─────────────────────── Cancel task command ─────────────────────────────
-
-@Client.on_message(filters.private & filters.regex(r"^/cancel_([a-f0-9]+)$"))
-async def cmd_cancel_task(bot: Client, msg: Message):
-    task_id = msg.text.split("_")[1]
-    if task_id in _active:
-        _active[task_id]["cancelled"] = True
-        await msg.reply(f"🛑 Task `{task_id}` cancel ho raha hai...")
-    else:
-        await msg.reply("❌ Aisa koi task nahi mila.")
-
+# ─────────────────────────────────────────────────────────────────────────
 
 async def _edit_safe(message, text: str):
     try:
         await message.edit_text(text)
     except Exception:
         pass
-
-
-# ── Ye router.py ke liye hai (agar koi FORWARD_STATE step active ho) ─────
-async def handle_forward_step(bot: Client, msg: Message):
-    """Abhi koi text step nahi hai — sab inline buttons se hota hai."""
-    pass
