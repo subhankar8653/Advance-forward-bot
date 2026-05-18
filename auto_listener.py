@@ -1,14 +1,18 @@
 """
 Auto-Listener:
 - Userbot har rule ke source channel ko monitor karta hai
-- Naya message aaya → text process karo → targets pe forward karo
+- Naya message aaya → trigger words check → text process karo → targets pe forward karo
 - Affiliate bot option: pehle bot ko message bhejo, reply aaye toh forward karo
+- Stylish Unicode font support: 𝐌𝐎𝐍𝐃𝐀𝐘 → MONDAY detect hoga
 
 FIX: Affiliate bot flow - channel se forward_messages bot pe kaam nahi karta.
      Ab text/caption seedha send hoga bot ko.
 """
 import asyncio
 import logging
+import unicodedata
+import re
+
 from pyrogram import Client
 from pyrogram.handlers import MessageHandler
 from pyrogram.filters import channel
@@ -25,6 +29,118 @@ _handlers: dict[str, MessageHandler] = {}
 _rule_map: dict[str, dict] = {}
 _source_map: dict[int, list[str]] = {}
 
+
+# ─────────────────────── Unicode Stylish Font Normalizer ─────────────────
+# Telegram mein stylish fonts asal mein Unicode Mathematical letters hain
+# e.g. 𝐌 (U+1D400) → M, 𝕄 (U+1D544) → M, 𝓜 (U+1D4DC) → M
+# Yeh table unhe normal ASCII mein convert karta hai
+
+_UNICODE_TO_ASCII = {}
+
+def _build_unicode_map():
+    """Mathematical Unicode block characters ko normal ASCII mein map karo."""
+    ranges = [
+        # Bold, Italic, Bold Italic, Script, etc. (Mathematical Alphanumeric Symbols)
+        # Capital A-Z
+        (0x1D400, 0x1D419, 'A'),  # Bold
+        (0x1D434, 0x1D44D, 'A'),  # Italic
+        (0x1D468, 0x1D481, 'A'),  # Bold Italic
+        (0x1D49C, None,    'A'),  # Script (sparse)
+        (0x1D4D0, 0x1D4E9, 'A'),  # Bold Script
+        (0x1D504, 0x1D51C, 'A'),  # Fraktur (sparse)
+        (0x1D538, 0x1D551, 'A'),  # Double-struck (sparse)
+        (0x1D56C, 0x1D585, 'A'),  # Bold Fraktur
+        (0x1D5A0, 0x1D5B9, 'A'),  # Sans-serif
+        (0x1D5D4, 0x1D5ED, 'A'),  # Sans-serif Bold
+        (0x1D608, 0x1D621, 'A'),  # Sans-serif Italic
+        (0x1D63C, 0x1D655, 'A'),  # Sans-serif Bold Italic
+        (0x1D670, 0x1D689, 'A'),  # Monospace
+    ]
+    for start, end, base in ranges:
+        if end is None:
+            continue
+        for i in range(end - start + 1):
+            char = chr(start + i)
+            ascii_char = chr(ord(base) + i)
+            if ascii_char.isalpha():
+                _UNICODE_TO_ASCII[char] = ascii_char
+
+    # Lowercase a-z ranges
+    lower_ranges = [
+        (0x1D41A, 0x1D433, 'a'),  # Bold
+        (0x1D44E, 0x1D467, 'a'),  # Italic
+        (0x1D482, 0x1D49B, 'a'),  # Bold Italic
+        (0x1D4EA, 0x1D503, 'a'),  # Bold Script
+        (0x1D586, 0x1D59F, 'a'),  # Bold Fraktur
+        (0x1D5BA, 0x1D5D3, 'a'),  # Sans-serif
+        (0x1D5EE, 0x1D607, 'a'),  # Sans-serif Bold
+        (0x1D622, 0x1D63B, 'a'),  # Sans-serif Italic
+        (0x1D656, 0x1D66F, 'a'),  # Sans-serif Bold Italic
+        (0x1D68A, 0x1D6A3, 'a'),  # Monospace
+    ]
+    for start, end, base in lower_ranges:
+        for i in range(end - start + 1):
+            char = chr(start + i)
+            ascii_char = chr(ord(base) + i)
+            if ascii_char.isalpha():
+                _UNICODE_TO_ASCII[char] = ascii_char
+
+_build_unicode_map()
+
+
+def normalize_unicode_text(text: str) -> str:
+    """
+    Stylish Unicode mathematical fonts ko normal ASCII mein convert karo.
+    e.g. "𝐌𝐎𝐍𝐃𝐀𝐘" → "MONDAY", "𝓜𝓸𝓷𝓭𝓪𝔂" → "Monday"
+
+    Steps:
+    1. Custom map se mathematical Unicode replace karo
+    2. NFKD normalize karo (accented chars ke liye)
+    3. Non-ASCII strip karo
+    """
+    # Step 1: Mathematical Unicode → ASCII
+    result = []
+    for char in text:
+        if char in _UNICODE_TO_ASCII:
+            result.append(_UNICODE_TO_ASCII[char])
+        else:
+            result.append(char)
+    text = "".join(result)
+
+    # Step 2: NFKD normalization (é → e, etc.)
+    normalized = unicodedata.normalize("NFKD", text)
+
+    # Step 3: Only ASCII letters/digits/spaces/punctuation rakhna
+    ascii_text = "".join(
+        c for c in normalized
+        if unicodedata.category(c) != 'Mn'  # Remove combining marks
+    )
+
+    return ascii_text
+
+
+def _check_trigger_words(text: str, trigger_words: list) -> bool:
+    """
+    Message mein trigger words check karo.
+    - Case insensitive
+    - Stylish Unicode font support (e.g. 𝐌𝐎𝐍𝐃𝐀𝐘 = MONDAY)
+    - Partial match bhi chalega (word substring match)
+    """
+    if not trigger_words:
+        return True  # Koi trigger set nahi → sab messages forward karo
+
+    # Message text ko normalize karo
+    normalized = normalize_unicode_text(text).lower()
+
+    for word in trigger_words:
+        word_lower = word.lower().strip()
+        if word_lower and word_lower in normalized:
+            return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
 
 async def start_listeners():
     all_rules = await db.get_all_rules()
@@ -99,6 +215,16 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
     hide_links     = rule.get("hide_links", False)
     hide_usernames = rule.get("hide_usernames", False)
     replace_map    = rule.get("replace_map", {})
+    trigger_words  = rule.get("trigger_words", [])  # NEW: trigger words list
+
+    # ── Trigger word check ───────────────────────────────────
+    # Message ka raw text nikalo (stylish font support ke saath)
+    raw_text = message.text or message.caption or ""
+
+    if trigger_words:
+        if not _check_trigger_words(raw_text, trigger_words):
+            logger.debug(f"Message skipped — no trigger word match. Rule: {rule['rule_id']}")
+            return  # Trigger match nahi hua → skip
 
     # ── Affiliate bot flow ───────────────────────────────────
     if affiliate_bot:
@@ -115,7 +241,6 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
         # fallback: normal forward
 
     # ── Normal forward ───────────────────────────────────────
-    raw_text = message.text or message.caption or ""
     new_text = process_text(
         raw_text,
         hide_links=hide_links,
@@ -136,7 +261,9 @@ async def _forward_one(client: Client, message: Message, target: int, new_text: 
                 message_id=message.id, caption=new_text or None
             )
         else:
-            await client.send_message(target, new_text or ".")
+            if new_text:
+                await client.send_message(target, new_text)
+            # Agar text empty hai toh skip (kuch forward karne layak nahi)
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
         await _forward_one(client, message, target, new_text)
@@ -162,7 +289,6 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
     Channel messages ko directly forward nahi kar sakte private bot pe.
     Solution: Message ka text/caption seedha send karo.
     """
-    # bot_id integer ya string dono handle karo (backward compat)
     if isinstance(bot_id, str):
         try:
             bot_chat = await client.get_chat(bot_id)
@@ -171,7 +297,7 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
             logger.error(f"Affiliate bot resolve failed: {e}")
             return None
 
-    replied  = asyncio.get_event_loop().create_future()
+    replied = asyncio.get_event_loop().create_future()
 
     async def _wait_reply(_: Client, msg: Message):
         if msg.chat.id == bot_id and not replied.done():
@@ -185,10 +311,8 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
         text_to_send = original.text or original.caption or ""
 
         if text_to_send:
-            # Text/caption seedha bhejo
             await client.send_message(bot_id, text_to_send)
         elif original.media:
-            # Pure media: copy_message try karo
             await client.copy_message(
                 chat_id=bot_id,
                 from_chat_id=original.chat.id,
@@ -200,7 +324,7 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
         response = await asyncio.wait_for(replied, timeout=15)
         return response
     except asyncio.TimeoutError:
-        logger.warning(f"Affiliate bot {bot_username} did not reply in time.")
+        logger.warning(f"Affiliate bot {bot_id} did not reply in time.")
         return None
     finally:
         client.remove_handler(h)
