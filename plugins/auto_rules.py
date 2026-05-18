@@ -45,9 +45,20 @@ async def handle_auto_step(bot: Client, msg: Message):
     if step == "source":
         import re
         source_id = None
+
+        # Method 1: forward_from_chat (normal public channels)
         if msg.forward_from_chat:
             source_id = msg.forward_from_chat.id
-        elif text:
+
+        # Method 2: forward_origin (Pyrogram newer versions / Bot API)
+        if not source_id and hasattr(msg, "forward_origin") and msg.forward_origin:
+            origin = msg.forward_origin
+            if hasattr(origin, "chat") and origin.chat:
+                source_id = origin.chat.id
+
+        # Method 3: Text mein link ya ID
+        if not source_id and text:
+            # t.me link
             m = re.search(r't\.me/(?:c/)?(\-?\d+|[A-Za-z0-9_]+)', text)
             if m:
                 raw = m.group(1)
@@ -60,8 +71,32 @@ async def handle_auto_step(bot: Client, msg: Message):
                         source_id = chat.id
                     except Exception:
                         pass
+
+            # Direct numeric ID (e.g. -1001234567890)
+            if not source_id:
+                clean = text.strip()
+                if clean.lstrip("-").isdigit():
+                    source_id = int(clean)
+
         if not source_id:
-            return await msg.reply("❌ Samajh nahi aaya. Channel ka message forward karo ya link do.")
+            # Restricted channel warning
+            hint = ""
+            if msg.forward_sender_name or (hasattr(msg, "forward_origin") and msg.forward_origin):
+                hint = (
+                    "\n\n⚠️ **Restricted channel detected!**\n"
+                    "Is channel ne forwarding restrict ki hui hai.\n"
+                    "Channel ID manually bhejo:\n"
+                    "1. @userinfobot pe jaao\n"
+                    "2. Us channel ka koi message forward karo wahan\n"
+                    "3. Jo ID mile woh yahan bhejo\n"
+                    "Example: `-1001556054753`"
+                )
+            return await msg.reply(
+                "❌ Channel detect nahi hua." + hint +
+                "\n\nYa seedha channel link bhejo:\n`https://t.me/channelname`\n\n"
+                "/cancel — cancel"
+            )
+
         state["source_id"] = source_id
         state["step"]      = "targets"
         await msg.reply(
@@ -376,9 +411,19 @@ async def handle_edit_step(bot: Client, msg: Message):
 
     if field == "source":
         source_id = None
+
+        # Method 1: forward_from_chat
         if msg.forward_from_chat:
             source_id = msg.forward_from_chat.id
-        elif text:
+
+        # Method 2: forward_origin (newer API)
+        if not source_id and hasattr(msg, "forward_origin") and msg.forward_origin:
+            origin = msg.forward_origin
+            if hasattr(origin, "chat") and origin.chat:
+                source_id = origin.chat.id
+
+        # Method 3: Text link ya direct ID
+        if not source_id and text:
             m = re.search(r't\.me/(?:c/)?(\-?\d+|[A-Za-z0-9_]+)', text)
             if m:
                 raw = m.group(1)
@@ -391,8 +436,14 @@ async def handle_edit_step(bot: Client, msg: Message):
                         source_id = chat.id
                     except Exception:
                         pass
+            if not source_id and text.strip().lstrip("-").isdigit():
+                source_id = int(text.strip())
+
         if not source_id:
-            return await msg.reply("❌ Source samajh nahi aaya. Dobara koshish karo.")
+            hint = ""
+            if msg.forward_sender_name or (hasattr(msg, "forward_origin") and msg.forward_origin):
+                hint = "\n\n⚠️ Restricted channel — ID manually bhejo (e.g. `-1001234567890`)"
+            return await msg.reply("❌ Source samajh nahi aaya. Dobara koshish karo." + hint)
         new_val = source_id
 
     elif field == "targets":
