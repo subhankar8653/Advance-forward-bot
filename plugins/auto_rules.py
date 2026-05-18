@@ -87,12 +87,11 @@ async def handle_auto_step(bot: Client, msg: Message):
         if text.lower() == "skip":
             state["affiliate_bot"] = None
         else:
-            # Username ya user_id — resolve karke integer ID store karo
             uname = text.lstrip("@")
             try:
                 client = await get_client(owner_id)
                 bot_chat = await client.get_chat(uname)
-                state["affiliate_bot"] = bot_chat.id  # integer ID store
+                state["affiliate_bot"] = bot_chat.id
             except Exception:
                 return await msg.reply(
                     f"❌ Bot `@{uname}` resolve nahi hua.\n"
@@ -109,7 +108,7 @@ async def handle_auto_step(bot: Client, msg: Message):
                 InlineKeyboardButton("🔗 Hide Links: OFF", callback_data=f"aflag#{owner_id}#hide_links"),
                 InlineKeyboardButton("👤 Hide @user: OFF", callback_data=f"aflag#{owner_id}#hide_usernames"),
             ],
-            [InlineKeyboardButton("✅ Done", callback_data=f"aflag#{owner_id}#done")]
+            [InlineKeyboardButton("✅ Done → Step 5/5", callback_data=f"aflag#{owner_id}#done")]
         ])
         await msg.reply("**Step 4/5** — Hide settings choose karo:", reply_markup=buttons)
 
@@ -119,9 +118,18 @@ async def handle_auto_step(bot: Client, msg: Message):
             for line in text.split("\n"):
                 if "|" in line:
                     parts = line.split("|", 1)
-                    replace_map[parts[0].strip()] = parts[1].strip()
+                    old_t = parts[0].strip()
+                    new_t = parts[1].strip()
+                    if old_t:
+                        replace_map[old_t] = new_t
         state["replace_map"] = replace_map
+        # Step complete — save karo
+        AUTO_STATE.pop(owner_id, None)
         await _save_rule(msg, owner_id, state)
+
+    else:
+        # Unknown step — ignore
+        pass
 
 
 @Client.on_callback_query(filters.regex(r"^aflag#"))
@@ -132,13 +140,20 @@ async def cb_aflag(bot: Client, query: CallbackQuery):
         return await query.answer("Yeh tumhara nahi.", show_alert=True)
 
     state = AUTO_STATE.get(owner_id, {})
+    if not state:
+        return await query.answer("❌ Session expire ho gaya. /auto dobara karo.", show_alert=True)
+
     if flag == "done":
         state["step"] = "replace"
+        AUTO_STATE[owner_id] = state  # ensure updated state saved
         await query.message.edit_text(
             "**Step 5/5** — Text replacements do\n\n"
             "Format (har line):\n`purana_text | naya_text`\n\n"
-            "`skip` — koi replacement nahi"
+            "Example:\n`@WatcherGuru | @MyCryptoChannel`\n\n"
+            "`skip` — koi replacement nahi\n\n"
+            "/cancel — cancel"
         )
+        await query.answer()
         return
 
     state[flag] = not state.get(flag, False)
@@ -149,7 +164,7 @@ async def cb_aflag(bot: Client, query: CallbackQuery):
             InlineKeyboardButton(f"🔗 Hide Links: {hl}", callback_data=f"aflag#{owner_id}#hide_links"),
             InlineKeyboardButton(f"👤 Hide @user: {hu}", callback_data=f"aflag#{owner_id}#hide_usernames"),
         ],
-        [InlineKeyboardButton("✅ Done", callback_data=f"aflag#{owner_id}#done")]
+        [InlineKeyboardButton("✅ Done → Step 5/5", callback_data=f"aflag#{owner_id}#done")]
     ])
     await query.message.edit_reply_markup(buttons)
     await query.answer()
@@ -167,7 +182,6 @@ async def _save_rule(msg: Message, owner_id: int, state: dict):
         "replace_map"   : state.get("replace_map", {}),
     }
     await db.add_auto_rule(owner_id, rule)
-    AUTO_STATE.pop(owner_id, None)
     from auto_listener import register_rule
     await register_rule(owner_id, rule)
     await msg.reply(
@@ -241,9 +255,13 @@ async def cb_edit_rule(bot: Client, query: CallbackQuery):
     if not rule:
         return await query.message.edit_text("❌ Rule nahi mila.")
 
-    hl = "ON ✅" if rule.get("hide_links") else "OFF"
-    hu = "ON ✅" if rule.get("hide_usernames") else "OFF"
+    hl  = "ON ✅" if rule.get("hide_links") else "OFF"
+    hu  = "ON ✅" if rule.get("hide_usernames") else "OFF"
     aff = rule.get("affiliate_bot") or "None"
+    rmap = rule.get("replace_map", {})
+    rmap_preview = ", ".join(f"`{k}`→`{v}`" for k, v in list(rmap.items())[:3])
+    if len(rmap) > 3:
+        rmap_preview += f" (+{len(rmap)-3} more)"
 
     buttons = InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 Source Change", callback_data=f"redit#{owner_id}#{rule_id}#source")],
@@ -254,6 +272,7 @@ async def cb_edit_rule(bot: Client, query: CallbackQuery):
             InlineKeyboardButton(f"👤 @user: {hu}", callback_data=f"redit#{owner_id}#{rule_id}#hide_usernames"),
         ],
         [InlineKeyboardButton("🔄 Replace Map", callback_data=f"redit#{owner_id}#{rule_id}#replace")],
+        [InlineKeyboardButton("⚡ Trigger Words", callback_data=f"redit#{owner_id}#{rule_id}#triggers")],
         [InlineKeyboardButton("❌ Close", callback_data=f"redit#{owner_id}#{rule_id}#close")],
     ])
     await query.message.edit_text(
@@ -263,7 +282,8 @@ async def cb_edit_rule(bot: Client, query: CallbackQuery):
         f"• Affiliate: {aff}\n"
         f"• Hide links: {rule.get('hide_links', False)}\n"
         f"• Hide @users: {rule.get('hide_usernames', False)}\n"
-        f"• Replacements: {len(rule.get('replace_map', {}))}\n\n"
+        f"• Replacements: {len(rmap)}" + (f" — {rmap_preview}" if rmap_preview else "") + "\n"
+        f"• Trigger words: {len(rule.get('trigger_words', []))} set\n\n"
         "Kya change karna hai?",
         reply_markup=buttons
     )
@@ -292,7 +312,6 @@ async def cb_redit(bot: Client, query: CallbackQuery):
         if rule_id in _rule_map:
             _rule_map[rule_id][field] = new_val
         await query.answer(f"{'ON' if new_val else 'OFF'} kar diya!", show_alert=False)
-        # Refresh edit panel
         rule[field] = new_val
         hl  = "ON ✅" if rule.get("hide_links") else "OFF"
         hu  = "ON ✅" if rule.get("hide_usernames") else "OFF"
@@ -306,6 +325,7 @@ async def cb_redit(bot: Client, query: CallbackQuery):
                 InlineKeyboardButton(f"👤 @user: {hu}", callback_data=f"redit#{owner_id}#{rule_id}#hide_usernames"),
             ],
             [InlineKeyboardButton("🔄 Replace Map", callback_data=f"redit#{owner_id}#{rule_id}#replace")],
+            [InlineKeyboardButton("⚡ Trigger Words", callback_data=f"redit#{owner_id}#{rule_id}#triggers")],
             [InlineKeyboardButton("❌ Close", callback_data=f"redit#{owner_id}#{rule_id}#close")],
         ])
         return await query.message.edit_reply_markup(buttons)
@@ -318,9 +338,23 @@ async def cb_redit(bot: Client, query: CallbackQuery):
         "source"   : "📥 Naya **source channel** bhejo:\nForward karo ya link do (e.g. `https://t.me/c/123/1`)",
         "targets"  : "📤 Naye **target channel IDs** bhejo (space se alag):\nExample: `-1001234 -1005678`",
         "affiliate": "🤖 Naya **affiliate bot** @username bhejo\n(`skip` — remove karne ke liye)",
-        "replace"  : "🔄 Naya **replace map** bhejo\nFormat: `purana | naya` (har line)\n`skip` — replace hata do",
+        "replace"  : (
+            "🔄 Naya **replace map** bhejo\n"
+            "Format: `purana | naya` (har line)\n\n"
+            "Example:\n`@WatcherGuru | @MyCryptoChannel`\n\n"
+            "`skip` — replace hata do\n\n/cancel — cancel"
+        ),
+        "triggers" : (
+            "⚡ **Trigger words** bhejo (comma se alag)\n\n"
+            "Example: `monday, tuesday, wednesday`\n\n"
+            "Jab bhi source channel mein koi word match karega\n"
+            "(stylish font bhi detect hoga automatically)\n\n"
+            "`skip` — trigger words hata do (sab messages forward honge)\n\n"
+            "/cancel — cancel"
+        ),
     }
     await query.message.edit_text(prompts.get(field, "Value bhejo:") + "\n\n/cancel — cancel")
+    await query.answer()
 
 
 async def handle_edit_step(bot: Client, msg: Message):
@@ -375,7 +409,7 @@ async def handle_edit_step(bot: Client, msg: Message):
             try:
                 client = await get_client(owner_id)
                 bot_chat = await client.get_chat(uname)
-                new_val = bot_chat.id  # integer ID store
+                new_val = bot_chat.id
             except Exception:
                 EDIT_STATE.pop(owner_id, None)
                 return await msg.reply(
@@ -388,8 +422,19 @@ async def handle_edit_step(bot: Client, msg: Message):
             for line in text.split("\n"):
                 if "|" in line:
                     parts = line.split("|", 1)
-                    replace_map[parts[0].strip()] = parts[1].strip()
+                    old_t = parts[0].strip()
+                    new_t = parts[1].strip()
+                    if old_t:
+                        replace_map[old_t] = new_t
         new_val = replace_map
+
+    elif field == "triggers":
+        if text.lower() == "skip":
+            new_val = []
+        else:
+            # Comma-separated words, strip spaces
+            words = [w.strip().lower() for w in text.split(",") if w.strip()]
+            new_val = words
 
     # DB update
     rule = await db.get_rule_by_id(rule_id)
@@ -403,7 +448,6 @@ async def handle_edit_step(bot: Client, msg: Message):
     # Live _rule_map update
     from auto_listener import _rule_map, unregister_rule, register_rule
     if field == "source":
-        # Source change: old listener hata do, naya lagao
         unregister_rule(rule_id)
         updated = {**rule, field: new_val}
         await register_rule(owner_check, updated)
@@ -411,4 +455,17 @@ async def handle_edit_step(bot: Client, msg: Message):
         _rule_map[rule_id][field] = new_val
 
     EDIT_STATE.pop(owner_id, None)
-    await msg.reply(f"✅ Rule `{rule_id}` ka **{field}** update ho gaya!")
+
+    if field == "triggers":
+        words_display = ", ".join(new_val) if new_val else "None (sab messages forward honge)"
+        await msg.reply(
+            f"✅ Rule `{rule_id}` ke trigger words update ho gaye!\n\n"
+            f"Active triggers: `{words_display}`"
+        )
+    elif field == "replace":
+        await msg.reply(
+            f"✅ Rule `{rule_id}` ka replace map update ho gaya!\n"
+            f"Replacements: {len(new_val)}"
+        )
+    else:
+        await msg.reply(f"✅ Rule `{rule_id}` ka **{field}** update ho gaya!")
