@@ -255,9 +255,24 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
         await asyncio.sleep(1)
 
 
+def _has_media(message: Message) -> bool:
+    """Check karo ki message mein koi bhi media hai ya nahi."""
+    return bool(
+        message.media
+        or message.photo
+        or message.video
+        or message.document
+        or message.animation
+        or message.sticker
+        or message.audio
+        or message.voice
+        or message.video_note
+    )
+
+
 async def _forward_one(client: Client, message: Message, target: int, new_text: str):
     try:
-        if message.media:
+        if _has_media(message):
             await client.copy_message(
                 chat_id=target, from_chat_id=message.chat.id,
                 message_id=message.id, caption=new_text or None
@@ -265,7 +280,7 @@ async def _forward_one(client: Client, message: Message, target: int, new_text: 
         else:
             if new_text:
                 await client.send_message(target, new_text)
-            # Agar text empty hai toh skip (kuch forward karne layak nahi)
+            # Agar text empty hai toh skip
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
         await _forward_one(client, message, target, new_text)
