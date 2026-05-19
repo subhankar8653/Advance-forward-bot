@@ -3,6 +3,7 @@ Text processing utilities:
 - Links hide/replace
 - @username hide/replace
 - Custom find-replace
+- Bold text apply (Telegram HTML bold)
 """
 import re
 
@@ -14,15 +15,34 @@ _TG_LINK_RE  = re.compile(r'(https?://)?(t\.me|telegram\.me|telegram\.dog)/\S+',
 _USERNAME_RE = re.compile(r'@[A-Za-z0-9_]{3,}')
 
 
+def make_bold(text: str) -> str:
+    """
+    Pure text ko Telegram HTML bold mein wrap karo.
+    Line by line bold karta hai taaki formatting sahi rahe.
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    bold_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped:
+            bold_lines.append(f"<b>{line}</b>")
+        else:
+            bold_lines.append(line)  # Empty lines as-is rakhna
+    return "\n".join(bold_lines)
+
+
 def process_text(
     text: str,
     hide_links: bool       = False,
     hide_usernames: bool   = False,
     replace_map: dict      = None,   # {old_str: new_str}
+    bold_text: bool        = False,  # NEW: text bold karna
 ) -> str:
     """
     Text ko clean karo rules ke hisab se.
-    replace_map pehle apply hoga, phir hide rules.
+    replace_map pehle apply hoga, phir hide rules, phir bold.
     """
     if not text:
         return text
@@ -43,6 +63,11 @@ def process_text(
 
     # Clean extra blank lines
     text = re.sub(r'\n{3,}', '\n\n', text).strip()
+
+    # 4. Bold text wrap (sabse aakhir mein)
+    if bold_text:
+        text = make_bold(text)
+
     return text
 
 

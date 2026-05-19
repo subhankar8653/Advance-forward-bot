@@ -68,7 +68,7 @@ class Database:
     async def get_all_userbot_records(self):
         return [r async for r in self.userbots.find({})]
 
-    # ─────────────────────── WORKER BOTS (NEW) ──────────────────────────
+    # ─────────────────────── WORKER BOTS ──────────────────────────
     # Schema: { owner_id, token, name, username, slot }
 
     async def save_worker(self, owner_id: int, token: str, name: str, username: str) -> int:
@@ -106,22 +106,58 @@ class Database:
         return [r async for r in self.worker_bots.find({})]
 
     # ────────────────────────── AUTO RULES ─────────────────────────────
+    # Rule schema (full):
+    # {
+    #   rule_id, owner_id, source_id, targets,
+    #   affiliate_bot,
+    #   hide_links, hide_usernames,
+    #   remove_thumbnail,        ← NEW: thumbnail hatana (bool)
+    #   bold_text,               ← NEW: text bold karna (bool)
+    #   replace_map,
+    #   specific_forward_mode,   ← NEW: "forward" | "not_forward" | None
+    #   trigger_words,           ← NEW: list of words
+    # }
 
     async def add_auto_rule(self, owner_id: int, rule: dict):
         rule["owner_id"] = owner_id
+        # Naye fields ka default set karo agar missing ho
+        # (purane rules ke saath backward compatible)
+        rule.setdefault("remove_thumbnail",      False)
+        rule.setdefault("bold_text",             False)
+        rule.setdefault("specific_forward_mode", None)
+        rule.setdefault("trigger_words",         [])
         await self.auto_rules.insert_one(rule)
 
     async def get_auto_rules(self, owner_id: int):
-        return [r async for r in self.auto_rules.find({"owner_id": owner_id})]
+        rules = [r async for r in self.auto_rules.find({"owner_id": owner_id})]
+        # Purane rules ke liye missing fields ka default dena
+        for r in rules:
+            r.setdefault("remove_thumbnail",      False)
+            r.setdefault("bold_text",             False)
+            r.setdefault("specific_forward_mode", None)
+            r.setdefault("trigger_words",         [])
+        return rules
 
     async def get_rule_by_id(self, rule_id: str):
-        return await self.auto_rules.find_one({"rule_id": rule_id})
+        r = await self.auto_rules.find_one({"rule_id": rule_id})
+        if r:
+            r.setdefault("remove_thumbnail",      False)
+            r.setdefault("bold_text",             False)
+            r.setdefault("specific_forward_mode", None)
+            r.setdefault("trigger_words",         [])
+        return r
 
     async def delete_auto_rule(self, owner_id: int, rule_id: str):
         await self.auto_rules.delete_one({"owner_id": owner_id, "rule_id": rule_id})
 
     async def get_all_rules(self):
-        return [r async for r in self.auto_rules.find({})]
+        rules = [r async for r in self.auto_rules.find({})]
+        for r in rules:
+            r.setdefault("remove_thumbnail",      False)
+            r.setdefault("bold_text",             False)
+            r.setdefault("specific_forward_mode", None)
+            r.setdefault("trigger_words",         [])
+        return rules
 
     # ────────────────────────── MANUAL TASKS ───────────────────────────
 
