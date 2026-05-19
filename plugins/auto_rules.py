@@ -24,8 +24,7 @@ async def cmd_auto(bot: Client, msg: Message):
     await msg.reply(
         "🔁 **New Auto-Forward Rule**\n\n"
         "**Step 1/7** — Source channel ka koi bhi ek message forward karo\n"
-        "ya channel id bhejo\n\n"
-        "Example: `-1001234567890`\n\n"
+        "ya channel id bhejo\n\n
         "/cancel — cancel"
     )
 
@@ -85,7 +84,7 @@ async def handle_auto_step(bot: Client, msg: Message):
                     "1. @userinfobot pe jaao\n"
                     "2. Us channel ka koi message forward karo wahan\n"
                     "3. Jo ID mile woh yahan bhejo\n"
-                    "Example: `-1001556054753`"
+                    
                 )
             return await msg.reply(
                 "❌ Channel detect nahi hua." + hint +
@@ -98,7 +97,7 @@ async def handle_auto_step(bot: Client, msg: Message):
         await msg.reply(
             "✅ Source set!\n\n"
             "**Step 2/7** — Target channel(s) ke IDs bhejo (space se alag):\n"
-            "Example: `-1001234567890 -1009876543210`\n\n"
+            
             "💡 @userinfobot se channel ID pata karo."
         )
 
