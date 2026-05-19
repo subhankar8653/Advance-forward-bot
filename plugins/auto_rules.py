@@ -371,7 +371,37 @@ async def cb_del_rule(bot: Client, query: CallbackQuery):
     await db.delete_auto_rule(owner_id, rule_id)
     from auto_listener import unregister_rule
     unregister_rule(rule_id)
-    await query.message.edit_text(f"✅ Rule `{rule_id}` delete ho gaya.")
+
+    # Delete ke baad updated rules list show karo
+    rules = await db.get_auto_rules(owner_id)
+    if not rules:
+        await query.message.edit_text(f"✅ Rule `{rule_id}` delete ho gaya.\n\n📭 Ab koi rule nahi hai. Banao: /auto")
+        return
+
+    client = await get_client(owner_id)
+    lines   = []
+    buttons = []
+    for r in rules:
+        rid = r["rule_id"]
+        try:
+            src  = await client.get_chat(r["source_id"])
+            name = src.title or str(r["source_id"])
+        except Exception:
+            name = str(r["source_id"])
+        lines.append(
+            f"🔹 `{rid}` — {name} → {len(r['targets'])} target(s)\n"
+            f"   Links: {r.get('hide_links',False)} | @hide: {r.get('hide_usernames',False)} | "
+            f"Thumb: {r.get('remove_thumbnail',False)} | Bold: {r.get('bold_text',False)}"
+        )
+        buttons.append([
+            InlineKeyboardButton(f"✏️ Edit {rid}", callback_data=f"edit_rule#{owner_id}#{rid}"),
+            InlineKeyboardButton(f"🗑 Delete {rid}", callback_data=f"del_rule#{owner_id}#{rid}")
+        ])
+
+    await query.message.edit_text(
+        f"✅ Rule `{rule_id}` delete ho gaya.\n\n📋 **Baaki Rules:**\n\n" + "\n\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 
 # ───────────────────────── EDIT RULE ──────────────────────────────────────
