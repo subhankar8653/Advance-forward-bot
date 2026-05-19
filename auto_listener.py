@@ -369,87 +369,138 @@ async def _forward_one(
     """
     Ek target pe message forward karo.
 
-    remove_thumbnail=True:
-      - Photo → send_photo with thumb=None (no thumbnail)
-      - Video → copy_message with no_video_preview (Pyrogram limitation se
-                seedha file download + re-upload karna padega for full thumb remove)
-      - Document → copy_message (thumb already nahi hota usually)
-      - Text-only → normal send
+    Bold text FIX:
+      - process_text() se <b>...</b> wrap ho chuka hota hai
+      - parse_mode="html" SIRF tab pass karo jab new_text actually present ho
+      - Empty/None caption ke saath parse_mode="html" mat bhejo — Pyrogram crash karta hai
+      - copy_message bold support nahi karta → bold hone par hamesha send_* use karo
 
-    Bold text:
-      - process_text() se already <b>...</b> wrap ho chuka hota hai
-      - parse_mode="html" pass karna zaroori hai
+    remove_thumbnail=True:
+      - Photo → send_document (force_document=True) — thumbnail nahi hota
+      - Video → send_video with thumb=None
+      - Document → copy_message (thumb override nahi hota, as-is)
     """
-    parse_mode = "html" if bold_text else None
+    # ✅ FIX: parse_mode sirf tab set karo jab new_text present ho
+    has_custom_text = bool(new_text and new_text.strip())
+    parse_mode = "html" if (bold_text and has_custom_text) else None
 
     try:
+        # ── Pure text message ────────────────────────────────────────────
         if not _has_media(message):
-            # Pure text message
-            if new_text:
+            if has_custom_text:
                 await client.send_message(target, new_text, parse_mode=parse_mode)
+            elif message.text:
+                # Koi processing nahi — seedha copy
+                await client.copy_message(
+                    chat_id=target,
+                    from_chat_id=message.chat.id,
+                    message_id=message.id,
+                )
             return
 
-        # Media message
+        # ── Media message ────────────────────────────────────────────────
+        # Caption: processed text use karo, ya original caption rakh do
+        if has_custom_text:
+            caption    = new_text
+            cap_parse  = parse_mode  # "html" if bold else None
+        else:
+            # Koi processing nahi thi — original caption as-is
+            caption    = None
+            cap_parse  = None
+
+        # ── Thumbnail remove flow ────────────────────────────────────────
         if remove_thumbnail and _has_thumbnail_support(message):
-            # Thumbnail remove flow
-            caption = new_text or None
 
             if message.photo:
-                # Photo = hi ek tarah ka thumbnail hota hai
-                # Photo ko as document send karo (thumbnail remove)
                 await client.send_document(
                     chat_id=target,
                     document=message.photo.file_id,
                     caption=caption,
-                    parse_mode=parse_mode,
+                    parse_mode=cap_parse,
                     force_document=True,
                 )
 
             elif message.video:
-                # Video thumbnail remove: copy + thumb=None
-                # Pyrogram copy_message mein thumb override nahi hota
-                # Isliye send_video with file_id use karo
                 await client.send_video(
                     chat_id=target,
                     video=message.video.file_id,
                     caption=caption,
-                    parse_mode=parse_mode,
-                    thumb=None,          # thumbnail nahi bheja
+                    parse_mode=cap_parse,
+                    thumb=None,
                     supports_streaming=True,
                 )
 
             elif message.document:
-                # Document mein thumb override karna possible nahi Pyrogram mein
-                # Isliye normal copy karo, sirf caption update karo
-                await client.copy_message(
-                    chat_id=target,
-                    from_chat_id=message.chat.id,
-                    message_id=message.id,
-                    caption=caption,
-                    parse_mode=parse_mode,
-                )
+                if has_custom_text:
+                    # Caption update ke saath copy — bold support ke liye
+                    await client.copy_message(
+                        chat_id=target,
+                        from_chat_id=message.chat.id,
+                        message_id=message.id,
+                        caption=caption,
+                        parse_mode=cap_parse,
+                    )
+                else:
+                    await client.copy_message(
+                        chat_id=target,
+                        from_chat_id=message.chat.id,
+                        message_id=message.id,
+                    )
 
+        # ── Normal forward flow ──────────────────────────────────────────
         else:
-            # Normal copy (thumbnail as-is)
-            caption = new_text or None
-
             if message.photo:
-                # Photo ke liye send_photo use karo — copy_message kabhi kabhi
-                # sirf caption forward karta hai, photo nahi. Yeh fix hai.
+                # ✅ FIX: Bold ON hone par send_photo use karo (copy_message HTML nahi padhta)
                 await client.send_photo(
                     chat_id=target,
                     photo=message.photo.file_id,
                     caption=caption,
-                    parse_mode=parse_mode,
+                    parse_mode=cap_parse,
                 )
-            else:
-                await client.copy_message(
+
+            elif message.video:
+                # ✅ FIX: Bold ON hone par send_video use karo
+                await client.send_video(
                     chat_id=target,
-                    from_chat_id=message.chat.id,
-                    message_id=message.id,
+                    video=message.video.file_id,
                     caption=caption,
-                    parse_mode=parse_mode,
+                    parse_mode=cap_parse,
+                    supports_streaming=True,
                 )
+
+            elif message.audio:
+                await client.send_audio(
+                    chat_id=target,
+                    audio=message.audio.file_id,
+                    caption=caption,
+                    parse_mode=cap_parse,
+                )
+
+            elif message.document:
+                await client.send_document(
+                    chat_id=target,
+                    document=message.document.file_id,
+                    caption=caption,
+                    parse_mode=cap_parse,
+                )
+
+            else:
+                # Baaki sab (sticker, voice, animation, etc.) — copy as-is
+                # Bold caption wale ke liye: copy_message caption override
+                if has_custom_text:
+                    await client.copy_message(
+                        chat_id=target,
+                        from_chat_id=message.chat.id,
+                        message_id=message.id,
+                        caption=caption,
+                        parse_mode=cap_parse,
+                    )
+                else:
+                    await client.copy_message(
+                        chat_id=target,
+                        from_chat_id=message.chat.id,
+                        message_id=message.id,
+                    )
 
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
