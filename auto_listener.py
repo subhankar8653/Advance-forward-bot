@@ -410,6 +410,10 @@ async def _forward_one(
 
 
 async def _send_message(client: Client, message: Message, target: int):
+    """
+    Affiliate bot ke reply ko target channel pe bhejo.
+    copy_message fail hone par (forward restricted) text/media directly send karo.
+    """
     try:
         await client.copy_message(
             chat_id=target, from_chat_id=message.chat.id, message_id=message.id
@@ -418,14 +422,51 @@ async def _send_message(client: Client, message: Message, target: int):
         await asyncio.sleep(e.value + 1)
         await _send_message(client, message, target)
     except Exception as e:
-        logger.error(f"Affiliate forward to {target} failed: {e}")
+        logger.warning(f"copy_message failed for affiliate reply ({e}), trying direct send...")
+        # Fallback: seedha text/media bhejo
+        try:
+            text = message.text or message.caption or ""
+            if message.photo:
+                await client.send_photo(
+                    chat_id=target,
+                    photo=message.photo.file_id,
+                    caption=text or None,
+                )
+            elif message.video:
+                await client.send_video(
+                    chat_id=target,
+                    video=message.video.file_id,
+                    caption=text or None,
+                    supports_streaming=True,
+                )
+            elif message.document:
+                await client.send_document(
+                    chat_id=target,
+                    document=message.document.file_id,
+                    caption=text or None,
+                )
+            elif text:
+                await client.send_message(target, text)
+            else:
+                logger.error(f"Affiliate forward to {target} failed: no sendable content")
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value + 1)
+            await _send_message(client, message, target)
+        except Exception as e2:
+            logger.error(f"Affiliate forward to {target} failed (fallback also): {e2}")
 
 
 async def _affiliate_process(client: Client, original: Message, bot_id) -> Message | None:
     """
     bot_id ab integer hai (username nahi).
     Channel messages ko directly forward nahi kar sakte private bot pe.
-    Solution: Message ka text/caption seedha send karo.
+    Solution: Message ka text/caption seedha send karo, bot ka reply capture karo.
+
+    FIX:
+    - private_filter use karo taaki sirf bot ke private replies capture hon
+    - sent message ka ID track karo for better debugging
+    - timeout 15 -> 20s
+    - Exception handling added
     """
     if isinstance(bot_id, str):
         try:
@@ -435,41 +476,51 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
             logger.error(f"Affiliate bot resolve failed: {e}")
             return None
 
-    replied = asyncio.get_event_loop().create_future()
+    loop = asyncio.get_event_loop()
+    replied: asyncio.Future = loop.create_future()
 
     async def _wait_reply(_: Client, msg: Message):
+        # Sirf affiliate bot ka private/direct message accept karo
         if msg.chat.id == bot_id and not replied.done():
             replied.set_result(msg)
 
     from pyrogram.handlers import MessageHandler as MH
-    h = MH(_wait_reply)
+    from pyrogram.filters import private as private_filter
+    h = MH(_wait_reply, filters=private_filter)
     client.add_handler(h)
 
     try:
         text_to_send = original.text or original.caption or ""
 
         if original.photo:
-            # Photo+caption dono bhejo — pehle sirf text jaata tha, photo nahi
-            await client.send_photo(
+            sent = await client.send_photo(
                 chat_id=bot_id,
                 photo=original.photo.file_id,
                 caption=text_to_send or None,
             )
         elif text_to_send:
-            await client.send_message(bot_id, text_to_send)
+            sent = await client.send_message(bot_id, text_to_send)
         elif original.media:
-            await client.copy_message(
+            sent = await client.copy_message(
                 chat_id=bot_id,
                 from_chat_id=original.chat.id,
-                message_id=original.id
+                message_id=original.id,
             )
         else:
+            logger.warning("Affiliate: original message mein koi content nahi.")
             return None
 
-        response = await asyncio.wait_for(replied, timeout=15)
+        logger.debug(f"Affiliate: message sent to bot {bot_id}, waiting for reply...")
+
+        response = await asyncio.wait_for(replied, timeout=20)
+        logger.debug(f"Affiliate: reply received from bot {bot_id}")
         return response
+
     except asyncio.TimeoutError:
-        logger.warning(f"Affiliate bot {bot_id} did not reply in time.")
+        logger.warning(f"Affiliate bot {bot_id} did not reply in time (20s timeout).")
+        return None
+    except Exception as e:
+        logger.error(f"Affiliate process error: {e}")
         return None
     finally:
         client.remove_handler(h)
