@@ -24,7 +24,7 @@ async def cmd_auto(bot: Client, msg: Message):
     await msg.reply(
         "🔁 **New Auto-Forward Rule**\n\n"
         "**Step 1/7** — Source channel ka koi bhi ek message forward karo\n"
-        "ya channel id bhejo\n\n
+        "ya channel id bhejo\n\n"
         "/cancel — cancel"
     )
 
