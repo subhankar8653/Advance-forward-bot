@@ -174,8 +174,31 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
     rule_id   = rule["rule_id"]
     source_id = rule["source_id"]
 
+    # Agar rule pehle se registered hai (edit ke waqt), pehle unregister karo
+    # Taaki purana source_id ka handler bhi sahi rahe
+    if rule_id in _rule_map:
+        old_source_id = _rule_map[rule_id].get("source_id")
+        if old_source_id and old_source_id != source_id:
+            # Source badla hai — purani source_map entry hata do
+            old_lst = _source_map.get(old_source_id, [])
+            if rule_id in old_lst:
+                old_lst.remove(rule_id)
+            # Agar us source ke liye ab koi rule nahi → handler bhi hata do
+            if not old_lst:
+                handler_key_old = f"src_{old_source_id}"
+                h_old = _handlers.pop(handler_key_old, None)
+                if h_old:
+                    for slots in _clients.values():
+                        for client in slots.values():
+                            try:
+                                client.remove_handler(h_old)
+                            except Exception:
+                                pass
+
+    # Rule map mein daalo — owner_id ensure karo
     _rule_map[rule_id] = {**rule, "owner_id": owner_id}
 
+    # Source map mein daalo — duplicate check ke saath
     if source_id not in _source_map:
         _source_map[source_id] = []
     if rule_id not in _source_map[source_id]:
@@ -183,6 +206,7 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
 
     handler_key = f"src_{source_id}"
     if handler_key not in _handlers:
+        # ✅ FIX: closure mein src_id capture karo properly
         async def _make_handler(src_id: int):
             async def handler(client: Client, message: Message):
                 if message.chat.id != src_id:
@@ -194,11 +218,23 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
         h  = MessageHandler(fn, filters=channel)
         _handlers[handler_key] = h
 
-        for oid, slots in _clients.items():
-            for client in slots.values():
+        # Sirf us owner ke clients mein add karo jo is rule ke owner hain
+        # Taaki doosre users ke messages mix na hon
+        owner_slots = _clients.get(owner_id, {})
+        for client in owner_slots.values():
+            client.add_handler(h)
+    else:
+        # Handler pehle se hai — lekin agar owner ka client naya login hua hai
+        # toh usmein bhi add karo
+        h = _handlers[handler_key]
+        owner_slots = _clients.get(owner_id, {})
+        for client in owner_slots.values():
+            try:
                 client.add_handler(h)
+            except Exception:
+                pass  # Already added — ignore
 
-    logger.info(f"Rule {rule_id} registered (source={source_id})")
+    logger.info(f"Rule {rule_id} registered (source={source_id}, owner={owner_id})")
 
 
 def unregister_rule(rule_id: str):
@@ -233,7 +269,20 @@ async def _on_new_message(client: Client, message: Message, source_id: int):
             if rule_id in stale_lst:
                 stale_lst.remove(rule_id)
             continue
-        asyncio.create_task(_process_and_forward(client, message, rule))
+
+        # ✅ FIX: Rule ke owner ka sahi client use karo
+        # Taaki ek user ka rule doosre user ke saath mix na ho
+        owner_id = rule.get("owner_id")
+        owner_slots = _clients.get(owner_id, {})
+        owner_client = None
+        for c in owner_slots.values():
+            owner_client = c
+            break  # pehla available client use karo
+
+        # Agar owner ka client nahi mila → current client fallback
+        use_client = owner_client if owner_client else client
+
+        asyncio.create_task(_process_and_forward(use_client, message, rule))
 
 
 async def _process_and_forward(client: Client, message: Message, rule: dict):
@@ -526,6 +575,27 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
         client.remove_handler(h)
 
 
-def attach_client_to_all_handlers(client: Client):
-    for h in _handlers.values():
-        client.add_handler(h)
+def attach_client_to_all_handlers(client: Client, owner_id: int = None):
+    """
+    Naya client login kiya → usse sirf us owner ke rules ke handlers attach karo.
+    owner_id=None hone par sab handlers attach ho jayenge (legacy/startup support).
+    """
+    if owner_id is not None:
+        # Sirf is owner ke rules ke source channels ke handlers add karo
+        owner_sources = set()
+        for rule_id, rule in _rule_map.items():
+            if rule.get("owner_id") == owner_id:
+                owner_sources.add(rule.get("source_id"))
+
+        for src_id in owner_sources:
+            handler_key = f"src_{src_id}"
+            h = _handlers.get(handler_key)
+            if h:
+                try:
+                    client.add_handler(h)
+                except Exception:
+                    pass
+    else:
+        # Fallback: sab handlers attach karo
+        for h in _handlers.values():
+            client.add_handler(h)
