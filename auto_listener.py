@@ -443,7 +443,14 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
     try:
         text_to_send = original.text or original.caption or ""
 
-        if text_to_send:
+        if original.photo:
+            # Photo+caption dono bhejo — pehle sirf text jaata tha, photo nahi
+            await client.send_photo(
+                chat_id=bot_id,
+                photo=original.photo.file_id,
+                caption=text_to_send or None,
+            )
+        elif text_to_send:
             await client.send_message(bot_id, text_to_send)
         elif original.media:
             await client.copy_message(
