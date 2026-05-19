@@ -174,8 +174,9 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
         h  = MessageHandler(fn, filters=channel)
         _handlers[handler_key] = h
 
-        for oid, client in _clients.items():
-            client.add_handler(h)
+        for oid, slots in _clients.items():
+            for client in slots.values():
+                client.add_handler(h)
 
     logger.info(f"Rule {rule_id} registered (source={source_id})")
 
@@ -194,8 +195,9 @@ def unregister_rule(rule_id: str):
         handler_key = f"src_{source_id}"
         h = _handlers.pop(handler_key, None)
         if h:
-            for client in _clients.values():
-                client.remove_handler(h)
+            for slots in _clients.values():
+                for client in slots.values():
+                    client.remove_handler(h)
 
     logger.info(f"Rule {rule_id} unregistered")
 
