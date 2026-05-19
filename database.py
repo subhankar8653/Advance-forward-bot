@@ -148,7 +148,7 @@ class Database:
         return r
 
     async def delete_auto_rule(self, owner_id: int, rule_id: str):
-        await self.auto_rules.delete_one({"owner_id": owner_id, "rule_id": rule_id})
+        await self.auto_rules.delete_one({"rule_id": rule_id})
 
     async def get_all_rules(self):
         rules = [r async for r in self.auto_rules.find({})]

@@ -223,10 +223,15 @@ def unregister_rule(rule_id: str):
 
 
 async def _on_new_message(client: Client, message: Message, source_id: int):
-    rule_ids = _source_map.get(source_id, [])
+    # list copy karo taaki stale entries se crash na ho
+    rule_ids = list(_source_map.get(source_id, []))
     for rule_id in rule_ids:
         rule = _rule_map.get(rule_id)
         if not rule:
+            # Stale entry — source_map se bhi hata do
+            stale_lst = _source_map.get(source_id, [])
+            if rule_id in stale_lst:
+                stale_lst.remove(rule_id)
             continue
         asyncio.create_task(_process_and_forward(client, message, rule))
 
