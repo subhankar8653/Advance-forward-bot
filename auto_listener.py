@@ -377,13 +377,25 @@ async def _forward_one(
 
         else:
             # Normal copy (thumbnail as-is)
-            await client.copy_message(
-                chat_id=target,
-                from_chat_id=message.chat.id,
-                message_id=message.id,
-                caption=new_text or None,
-                parse_mode=parse_mode,
-            )
+            caption = new_text or None
+
+            if message.photo:
+                # Photo ke liye send_photo use karo — copy_message kabhi kabhi
+                # sirf caption forward karta hai, photo nahi. Yeh fix hai.
+                await client.send_photo(
+                    chat_id=target,
+                    photo=message.photo.file_id,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                )
+            else:
+                await client.copy_message(
+                    chat_id=target,
+                    from_chat_id=message.chat.id,
+                    message_id=message.id,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                )
 
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
