@@ -147,7 +147,8 @@ class LoginSession:
             "phone_code_hash": sent.phone_code_hash,
             "step":            "otp"
         }
-        return "✅ OTP bheja! Code bhejo jaise: `12345`"
+        return "✅ OTP bheja! Code bhejo — spaces ke saath ya bina:
+`1 2 3 4 5` ya `12345` — dono chalega 👍"
 
     @classmethod
     async def submit_otp(cls, owner_id: int, code: str) -> str:
@@ -160,7 +161,7 @@ class LoginSession:
             await client.sign_in(
                 phone_number    = pending["phone"],
                 phone_code_hash = pending["phone_code_hash"],
-                phone_code      = code.strip()
+                phone_code      = "".join(code.split())  # spaces remove karo (5 0 8 9 7 → 50897)
             )
         except PhoneCodeInvalid:
             return "❌ Galat OTP. Dobara bhejo."
@@ -234,6 +235,28 @@ class LoginSession:
         if owner_id not in _clients:
             _clients[owner_id] = {}
         _clients[owner_id][slot] = live_client
+
+        # ✅ FIX: Login ke baad is owner ke saare rule targets join karo
+        # Bina join ke "Peer id invalid" error aata hai
+        try:
+            from database import db as _db
+            rules = await _db.get_auto_rules(owner_id)
+            for rule in rules:
+                for target_id in rule.get("targets", []):
+                    try:
+                        await live_client.join_chat(target_id)
+                        await asyncio.sleep(1)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"Auto-join targets failed: {e}")
+
+        # ✅ FIX: Naye client ke saath auto_listener handlers attach karo
+        try:
+            from auto_listener import attach_client_to_all_handlers
+            attach_client_to_all_handlers(live_client)
+        except Exception as e:
+            logger.warning(f"attach handlers failed: {e}")
 
         cls._pending.pop(owner_id, None)
         me = await live_client.get_me()
