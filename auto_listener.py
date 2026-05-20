@@ -1,85 +1,67 @@
 """
-Auto-Listener — Complete Fixed Version
-=======================================
-Fixes:
-1. _rule_map stale data bug — edit ke baad memory update nahi hoti thi
-2. Bold text + parse_mode crash — empty caption pe HTML crash
-3. copy_message bold support nahi karta — send_* use karo
-4. remove_thumbnail properly implement
-5. trigger_words + replace_map actually apply hote hain ab
-6. process_text result properly use hota hai
+Auto-Listener — v3 Complete Fixed
+===================================
+Bug fixes confirmed from logs:
+1. "Invalid parse mode html" — Pyrogram 2.0.106 mein parse_mode="html" invalid hai
+   Fix: pyrogram.enums.ParseMode.HTML use karo
+2. "Expected DOCUMENT, got PHOTO" — remove_thumbnail ke liye photo file_id document mein nahi jaata
+   Fix: photo download karke bytes bhejo ya send_photo use karo bina thumbnail ke
+3. "Peer id invalid" — userbot ne target channel join nahi kiya
+   Fix: error clearly log karo, crash mat karo
+4. Redeploy ke baad rules kaam nahi karte — start_listeners() mein userbot handlers theek se attach nahi hote
+   Fix: register_rule mein SARE clients pe handler lagao, sirf owner_id wale nahi
 """
 import asyncio
 import logging
 import unicodedata
-import re
 
-from pyrogram import Client
+from pyrogram import Client, enums
 from pyrogram.handlers import MessageHandler
 from pyrogram.filters import channel
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, PeerIdInvalid
 
 from database import db
-from userbot import get_client, _clients
+from userbot import _clients
 from utils import process_text
 
 logger = logging.getLogger(__name__)
 
-_handlers:    dict[str, MessageHandler] = {}
-_rule_map:    dict[str, dict]           = {}
-_source_map:  dict[int, list[str]]      = {}
+_handlers:   dict[str, MessageHandler] = {}
+_rule_map:   dict[str, dict]           = {}
+_source_map: dict[int, list[str]]      = {}
 
-
-# ─────────────────── Unicode Stylish Font Normalizer ────────────────────
+# ─────────────────────── Unicode Normalizer ──────────────────────────────
 
 _UNICODE_TO_ASCII = {}
 
-
 def _build_unicode_map():
-    upper_ranges = [
-        (0x1D400, 0x1D419, 'A'),
-        (0x1D434, 0x1D44D, 'A'),
-        (0x1D468, 0x1D481, 'A'),
-        (0x1D4D0, 0x1D4E9, 'A'),
-        (0x1D56C, 0x1D585, 'A'),
-        (0x1D5A0, 0x1D5B9, 'A'),
-        (0x1D5D4, 0x1D5ED, 'A'),
-        (0x1D608, 0x1D621, 'A'),
-        (0x1D63C, 0x1D655, 'A'),
-        (0x1D670, 0x1D689, 'A'),
+    ranges = [
+        (0x1D400, 0x1D419, 'A'), (0x1D434, 0x1D44D, 'A'),
+        (0x1D468, 0x1D481, 'A'), (0x1D4D0, 0x1D4E9, 'A'),
+        (0x1D56C, 0x1D585, 'A'), (0x1D5A0, 0x1D5B9, 'A'),
+        (0x1D5D4, 0x1D5ED, 'A'), (0x1D608, 0x1D621, 'A'),
+        (0x1D63C, 0x1D655, 'A'), (0x1D670, 0x1D689, 'A'),
+        (0x1D41A, 0x1D433, 'a'), (0x1D44E, 0x1D467, 'a'),
+        (0x1D482, 0x1D49B, 'a'), (0x1D4EA, 0x1D503, 'a'),
+        (0x1D586, 0x1D59F, 'a'), (0x1D5BA, 0x1D5D3, 'a'),
+        (0x1D5EE, 0x1D607, 'a'), (0x1D622, 0x1D63B, 'a'),
+        (0x1D656, 0x1D66F, 'a'), (0x1D68A, 0x1D6A3, 'a'),
     ]
-    lower_ranges = [
-        (0x1D41A, 0x1D433, 'a'),
-        (0x1D44E, 0x1D467, 'a'),
-        (0x1D482, 0x1D49B, 'a'),
-        (0x1D4EA, 0x1D503, 'a'),
-        (0x1D586, 0x1D59F, 'a'),
-        (0x1D5BA, 0x1D5D3, 'a'),
-        (0x1D5EE, 0x1D607, 'a'),
-        (0x1D622, 0x1D63B, 'a'),
-        (0x1D656, 0x1D66F, 'a'),
-        (0x1D68A, 0x1D6A3, 'a'),
-    ]
-    for start, end, base in upper_ranges + lower_ranges:
+    for start, end, base in ranges:
         for i in range(end - start + 1):
             char = chr(start + i)
             ascii_char = chr(ord(base) + i)
             if ascii_char.isalpha():
                 _UNICODE_TO_ASCII[char] = ascii_char
 
-
 _build_unicode_map()
 
-
 def normalize_unicode_text(text: str) -> str:
-    result = []
-    for char in text:
-        result.append(_UNICODE_TO_ASCII.get(char, char))
+    result = [_UNICODE_TO_ASCII.get(c, c) for c in text]
     text = "".join(result)
     normalized = unicodedata.normalize("NFKD", text)
     return "".join(c for c in normalized if unicodedata.category(c) != 'Mn')
-
 
 def _check_trigger_words(text: str, trigger_words: list) -> bool:
     if not trigger_words:
@@ -91,25 +73,20 @@ def _check_trigger_words(text: str, trigger_words: list) -> bool:
             return True
     return False
 
-
 def _should_forward(raw_text: str, rule: dict) -> bool:
     mode          = rule.get("specific_forward_mode")
     trigger_words = rule.get("trigger_words", [])
-
     if not mode and not trigger_words:
         return True
-
-    trigger_matched = _check_trigger_words(raw_text, trigger_words)
-
+    matched = _check_trigger_words(raw_text, trigger_words)
     if mode == "forward":
-        return trigger_matched
+        return matched
     elif mode == "not_forward":
-        return not trigger_matched
-    else:
-        return trigger_matched
+        return not matched
+    return matched
 
 
-# ─────────────────────────── Listener Lifecycle ──────────────────────────
+# ─────────────────────── Lifecycle ───────────────────────────────────────
 
 async def start_listeners():
     all_rules = await db.get_all_rules()
@@ -123,7 +100,7 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
     rule_id   = rule["rule_id"]
     source_id = rule["source_id"]
 
-    # Agar rule pehle registered tha aur source badla → cleanup karo
+    # Source change hone par purana handler cleanup
     if rule_id in _rule_map:
         old_source = _rule_map[rule_id].get("source_id")
         if old_source and old_source != source_id:
@@ -140,7 +117,6 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
                             except Exception:
                                 pass
 
-    # Hamesha fresh data store karo
     _rule_map[rule_id] = {**rule, "owner_id": owner_id}
 
     if source_id not in _source_map:
@@ -161,17 +137,22 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
         h  = MessageHandler(fn, filters=channel)
         _handlers[handler_key] = h
 
-        owner_slots = _clients.get(owner_id, {})
-        for c in owner_slots.values():
-            c.add_handler(h)
+        # ✅ FIX 4 (redeploy bug): SARE clients pe handler lagao
+        # Sirf owner_id wale nahi — kyunki restart pe sabka client fresh hai
+        for oid, slots in _clients.items():
+            for c in slots.values():
+                try:
+                    c.add_handler(h)
+                except Exception:
+                    pass
     else:
         h = _handlers[handler_key]
-        owner_slots = _clients.get(owner_id, {})
-        for c in owner_slots.values():
-            try:
-                c.add_handler(h)
-            except Exception:
-                pass
+        for oid, slots in _clients.items():
+            for c in slots.values():
+                try:
+                    c.add_handler(h)
+                except Exception:
+                    pass
 
     logger.info(f"Rule {rule_id} registered (source={source_id}, owner={owner_id})")
 
@@ -196,7 +177,7 @@ def unregister_rule(rule_id: str):
     logger.info(f"Rule {rule_id} unregistered")
 
 
-# ─────────────────────────── Message Handler ─────────────────────────────
+# ─────────────────────── Message Handler ─────────────────────────────────
 
 async def _on_new_message(client: Client, message: Message, source_id: int):
     rule_ids = list(_source_map.get(source_id, []))
@@ -208,8 +189,7 @@ async def _on_new_message(client: Client, message: Message, source_id: int):
                 stale.remove(rule_id)
             continue
 
-        # ✅ ROOT FIX: Har message pe DB se fresh rule fetch karo
-        # Taaki edit ke baad changes immediately apply hon
+        # DB se fresh rule fetch karo — edit changes turant apply hon
         try:
             fresh_rule = await db.get_rule_by_id(rule_id)
             if fresh_rule:
@@ -226,14 +206,14 @@ async def _on_new_message(client: Client, message: Message, source_id: int):
         asyncio.create_task(_process_and_forward(use_client, message, rule))
 
 
-# ─────────────────────────── Core Processing ─────────────────────────────
+# ─────────────────────── Core Processing ─────────────────────────────────
 
 async def _process_and_forward(client: Client, message: Message, rule: dict):
     targets          = rule["targets"]
     affiliate_bot    = rule.get("affiliate_bot")
     hide_links       = rule.get("hide_links", False)
     hide_usernames   = rule.get("hide_usernames", False)
-    replace_map      = rule.get("replace_map", {}) or {}
+    replace_map      = rule.get("replace_map") or {}
     remove_thumbnail = rule.get("remove_thumbnail", False)
     bold_text        = rule.get("bold_text", False)
 
@@ -254,7 +234,6 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
                 await _send_message(client, processed, target)
             return
 
-    # ✅ Text process — replace, hide, bold sab yahan hota hai
     new_text = process_text(
         raw_text,
         hide_links=hide_links,
@@ -274,7 +253,7 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
         await asyncio.sleep(1)
 
 
-# ─────────────────────────── Forward Logic ───────────────────────────────
+# ─────────────────────── Media Helpers ───────────────────────────────────
 
 def _has_media(message: Message) -> bool:
     return bool(
@@ -283,10 +262,11 @@ def _has_media(message: Message) -> bool:
         or message.voice or message.video_note or message.media
     )
 
-
 def _has_thumbnail(message: Message) -> bool:
     return bool(message.photo or message.video or message.document)
 
+
+# ─────────────────────── Forward Logic ───────────────────────────────────
 
 async def _forward_one(
     client: Client,
@@ -297,12 +277,14 @@ async def _forward_one(
     remove_thumbnail: bool = False,
     bold_text: bool = False,
 ):
-    has_text   = bool(new_text and new_text.strip())
-    parse_mode = "html" if (bold_text and has_text) else None
+    has_text = bool(new_text and new_text.strip())
+
+    # ✅ FIX 1: "Invalid parse mode html" — enums.ParseMode.HTML use karo string nahi
+    parse_mode = enums.ParseMode.HTML if (bold_text and has_text) else enums.ParseMode.DEFAULT
     send_text  = new_text if has_text else None
 
     try:
-        # ── Pure text ────────────────────────────────────────
+        # ── Pure text ──────────────────────────────────────────
         if not _has_media(message):
             if send_text:
                 await client.send_message(target, send_text, parse_mode=parse_mode)
@@ -314,49 +296,56 @@ async def _forward_one(
                 )
             return
 
-        # ── Remove thumbnail ─────────────────────────────────
+        # ── Remove thumbnail ────────────────────────────────────
         if remove_thumbnail and _has_thumbnail(message):
+
             if message.photo:
+                # ✅ FIX 2: "Expected DOCUMENT got PHOTO" — photo ko bytes download karke bhejo
+                # file_id directly document mein nahi jaata
+                photo_bytes = await client.download_media(message.photo, in_memory=True)
                 await client.send_document(
                     chat_id=target,
-                    document=message.photo.file_id,
+                    document=photo_bytes,
                     caption=send_text,
-                    parse_mode=parse_mode,
+                    parse_mode=parse_mode if send_text else enums.ParseMode.DEFAULT,
                     force_document=True,
                 )
+
             elif message.video:
-                await client.send_video(
+                video_bytes = await client.download_media(message.video, in_memory=True)
+                await client.send_document(
                     chat_id=target,
-                    video=message.video.file_id,
+                    document=video_bytes,
                     caption=send_text,
-                    parse_mode=parse_mode,
-                    thumb=None,
-                    supports_streaming=True,
+                    parse_mode=parse_mode if send_text else enums.ParseMode.DEFAULT,
+                    force_document=True,
                 )
+
             elif message.document:
+                # Document mein thumb override nahi hota — caption update karo sirf
                 await client.copy_message(
                     chat_id=target,
                     from_chat_id=message.chat.id,
                     message_id=message.id,
                     caption=send_text,
-                    parse_mode=parse_mode,
+                    parse_mode=parse_mode if send_text else enums.ParseMode.DEFAULT,
                 )
 
-        # ── Normal forward ────────────────────────────────────
+        # ── Normal forward ──────────────────────────────────────
         else:
             if message.photo:
                 await client.send_photo(
                     chat_id=target,
                     photo=message.photo.file_id,
                     caption=send_text,
-                    parse_mode=parse_mode,
+                    parse_mode=parse_mode if send_text else enums.ParseMode.DEFAULT,
                 )
             elif message.video:
                 await client.send_video(
                     chat_id=target,
                     video=message.video.file_id,
                     caption=send_text,
-                    parse_mode=parse_mode,
+                    parse_mode=parse_mode if send_text else enums.ParseMode.DEFAULT,
                     supports_streaming=True,
                 )
             elif message.audio:
@@ -364,28 +353,28 @@ async def _forward_one(
                     chat_id=target,
                     audio=message.audio.file_id,
                     caption=send_text,
-                    parse_mode=parse_mode,
+                    parse_mode=parse_mode if send_text else enums.ParseMode.DEFAULT,
                 )
             elif message.document:
                 await client.send_document(
                     chat_id=target,
                     document=message.document.file_id,
                     caption=send_text,
-                    parse_mode=parse_mode,
+                    parse_mode=parse_mode if send_text else enums.ParseMode.DEFAULT,
                 )
             elif message.animation:
                 await client.send_animation(
                     chat_id=target,
                     animation=message.animation.file_id,
                     caption=send_text,
-                    parse_mode=parse_mode,
+                    parse_mode=parse_mode if send_text else enums.ParseMode.DEFAULT,
                 )
             elif message.voice:
                 await client.send_voice(
                     chat_id=target,
                     voice=message.voice.file_id,
                     caption=send_text,
-                    parse_mode=parse_mode,
+                    parse_mode=parse_mode if send_text else enums.ParseMode.DEFAULT,
                 )
             else:
                 # sticker, video_note — as-is
@@ -395,6 +384,12 @@ async def _forward_one(
                     message_id=message.id,
                 )
 
+    except PeerIdInvalid:
+        # ✅ FIX 3: Peer invalid — userbot ne channel join nahi kiya
+        logger.error(
+            f"❌ Peer invalid: {target} — Userbot ne yeh channel join nahi kiya hai. "
+            f"Pehle userbot se us channel mein join karo."
+        )
     except FloodWait as e:
         logger.warning(f"FloodWait {e.value}s for target {target}")
         await asyncio.sleep(e.value + 1)
@@ -409,7 +404,7 @@ async def _forward_one(
         logger.error(f"Forward to {target} failed: {e}")
 
 
-# ─────────────────────────── Affiliate ───────────────────────────────────
+# ─────────────────────── Affiliate ───────────────────────────────────────
 
 async def _send_message(client: Client, message: Message, target: int):
     try:
@@ -437,7 +432,7 @@ async def _send_message(client: Client, message: Message, target: int):
             elif text:
                 await client.send_message(target, text)
         except Exception as e2:
-            logger.error(f"Affiliate forward fallback also failed: {e2}")
+            logger.error(f"Affiliate forward fallback failed: {e2}")
 
 
 async def _affiliate_process(client: Client, original: Message, bot_id) -> Message | None:
@@ -473,7 +468,6 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
                                       message_id=original.id)
         else:
             return None
-
         return await asyncio.wait_for(replied, timeout=20)
     except asyncio.TimeoutError:
         logger.warning(f"Affiliate bot {bot_id} timeout (20s)")
@@ -485,22 +479,12 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
         client.remove_handler(h)
 
 
-# ─────────────────────────── Client Attach ───────────────────────────────
+# ─────────────────────── Client Attach ───────────────────────────────────
 
 def attach_client_to_all_handlers(client: Client, owner_id: int = None):
-    if owner_id is not None:
-        owner_sources = {
-            rule.get("source_id")
-            for rule in _rule_map.values()
-            if rule.get("owner_id") == owner_id
-        }
-        for src_id in owner_sources:
-            h = _handlers.get(f"src_{src_id}")
-            if h:
-                try:
-                    client.add_handler(h)
-                except Exception:
-                    pass
-    else:
-        for h in _handlers.values():
+    """Naya client login → usse sab handlers attach karo."""
+    for h in _handlers.values():
+        try:
             client.add_handler(h)
+        except Exception:
+            pass
