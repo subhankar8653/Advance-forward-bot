@@ -147,8 +147,7 @@ class LoginSession:
             "phone_code_hash": sent.phone_code_hash,
             "step":            "otp"
         }
-        return "✅ OTP bheja! Code bhejo — spaces ke saath ya bina:
-`1 2 3 4 5` ya `12345` — dono chalega 👍"
+        return "✅ OTP bheja! Code bhejo — spaces ke saath ya bina:\n`1 2 3 4 5` ya `12345` — dono chalega 👍"
 
     @classmethod
     async def submit_otp(cls, owner_id: int, code: str) -> str:
