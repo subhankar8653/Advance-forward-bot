@@ -107,3 +107,16 @@ async def cb_status(bot: Client, query):
         f"• Forward Speed: ~{max(1, n_workers)}x\n"
         f"• Auto rules: {len(rules)}\n"
     )
+
+
+@Client.on_message(filters.private & filters.command("cancel"))
+async def cmd_cancel(bot: Client, msg: Message):
+    """Kisi bhi active wizard state ko cancel karo."""
+    from state_router import clear_all, active_state
+    owner_id = msg.from_user.id
+    state = active_state(owner_id)
+    clear_all(owner_id)
+    if state:
+        await msg.reply(f"❌ **{state.capitalize()} wizard cancel ho gaya.**")
+    else:
+        await msg.reply("✅ Koi active operation nahi tha.")

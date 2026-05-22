@@ -175,6 +175,23 @@ async def handle_auto_step(bot: Client, msg: Message):
         )
 
     # ── Step 7: Trigger Words ────────────────────────────────────────────
+    elif step == "specific_forward":
+        # User ne button ki jagah text bheja — buttons re-send karo
+        buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Only Specific Forward: OFF", callback_data=f"sfwd#{owner_id}#forward"),
+            ],
+            [
+                InlineKeyboardButton("🚫 Specific NOT Forward: OFF", callback_data=f"sfwd#{owner_id}#not_forward"),
+            ],
+            [InlineKeyboardButton("⏭ Skip → Step 7/7", callback_data=f"sfwd#{owner_id}#skip")],
+        ])
+        return await msg.reply(
+            "⚠️ Text nahi — **button tap karo:**\n\n"
+            "**Step 6/7** — Specific message forward setting:",
+            reply_markup=buttons
+        )
+
     elif step == "trigger_words":
         if text.lower() in ("skip", "/skip"):
             state["trigger_words"] = []
@@ -335,13 +352,17 @@ async def cmd_rules(bot: Client, msg: Message):
     if not rules:
         return await msg.reply("📭 Koi auto-forward rule nahi hai.\nBanao: /auto")
 
-    client  = await get_client(owner_id)
+    client  = await get_client(owner_id)  # None ho sakta hai — get_chat skip karega
     lines   = []
     buttons = []
     for r in rules:
         rid = r["rule_id"]
         try:
-            src  = await client.get_chat(r["source_id"])
+            if client:
+                src  = await client.get_chat(r["source_id"])
+                name = src.title or str(r["source_id"])
+            else:
+                name = str(r["source_id"])
             name = src.title or str(r["source_id"])
         except Exception:
             name = str(r["source_id"])
@@ -383,8 +404,11 @@ async def cb_del_rule(bot: Client, query: CallbackQuery):
     for r in rules:
         rid = r["rule_id"]
         try:
-            src  = await client.get_chat(r["source_id"])
-            name = src.title or str(r["source_id"])
+            if client:
+                src  = await client.get_chat(r["source_id"])
+                name = src.title or str(r["source_id"])
+            else:
+                name = str(r["source_id"])
         except Exception:
             name = str(r["source_id"])
         lines.append(
