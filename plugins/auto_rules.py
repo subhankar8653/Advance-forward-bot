@@ -729,7 +729,9 @@ async def handle_edit_step(bot: Client, msg: Message):
 
     owner_check = rule.get("owner_id")
     # "replace" field DB mein "replace_map" naam se store hoti hai
-    db_field = "replace_map" if field == "replace" else field
+    # Field name mapping: edit callback name → DB field name
+    _field_map = {"replace": "replace_map", "triggers": "trigger_words"}
+    db_field = _field_map.get(field, field)
     await db.update_rule_field(owner_check, rule_id, db_field, new_val)
 
     from auto_listener import _rule_map, unregister_rule, register_rule
