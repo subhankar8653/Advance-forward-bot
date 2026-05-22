@@ -52,10 +52,11 @@ def process_text(
         return text
 
     # 1. Custom replacements (pehle — taaki replaced text pe bhi hide kaam kare)
+    # Case-insensitive replace — WatcherGuru, @WatcherGuru, watcherguru sab match hoga
     if replace_map:
         for old, new in replace_map.items():
             if old:  # Empty key skip karo
-                text = text.replace(old, new)
+                text = re.sub(re.escape(old), new, text, flags=re.IGNORECASE)
 
     # 2. Telegram links hide
     if hide_links:
