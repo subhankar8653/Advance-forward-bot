@@ -161,14 +161,7 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
                     c.add_handler(h)
                 except Exception:
                     pass
-    else:
-        h = _handlers[handler_key]
-        for oid, slots in _clients.items():
-            for c in slots.values():
-                try:
-                    c.add_handler(h)
-                except Exception:
-                    pass
+    # Handler already exist karta hai — dobara add mat karo (duplicate fire hoga)
 
     logger.info(f"Rule {rule_id} registered (source={source_id}, owner={owner_id})")
 
