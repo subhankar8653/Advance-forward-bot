@@ -67,6 +67,16 @@ async def start_all_clients():
             _clients[owner_id][slot] = client
             me = await client.get_me()
             logger.info(f"Userbot started: owner={owner_id} slot={slot} name={me.first_name}")
+
+            # Warmup: Telegram ko signal do ki client active hai
+            # Bina iske redeploy ke baad updates nahi aate jab tak koi message na ho
+            try:
+                async for _ in client.get_dialogs(limit=5):
+                    break
+                logger.info(f"Warmup done: owner={owner_id} slot={slot}")
+            except Exception as warm_err:
+                logger.warning(f"Warmup failed (non-critical): owner={owner_id} slot={slot}: {warm_err}")
+
         except Exception as e:
             logger.error(f"Could not start userbot owner={owner_id} slot={slot}: {e}")
 
