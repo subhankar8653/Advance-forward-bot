@@ -151,30 +151,14 @@ async def handle_auto_step(bot: Client, msg: Message):
             # Nayi format (ek line): WatcherGuru : MyCryptoChannel | dark : white
             # Purani format (multiline): WatcherGuru | MyCryptoChannel (ek line mein ek pair)
             # Detect: agar line mein " : " hai toh nayi format, warna purani
-            all_pairs = []
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                if " : " in line:
-                    # Nayi format — | se multiple pairs alag karo
-                    for pair in line.split("|"):
-                        all_pairs.append(pair)
-                elif "|" in line:
-                    # Purani format — | se old/new alag karo
-                    all_pairs.append(line)
-            for pair in all_pairs:
+            # Format: WatcherGuru : MyCryptoChannel | dark : white
+            for pair in text.split("|"):
                 pair = pair.strip()
-                if " : " in pair:
-                    parts = pair.split(" : ", 1)
-                    old_t = parts[0].strip()
-                    new_t = parts[1].strip()
-                elif "|" in pair:
-                    parts = pair.split("|", 1)
-                    old_t = parts[0].strip()
-                    new_t = parts[1].strip()
-                else:
+                if " : " not in pair:
                     continue
+                parts = pair.split(" : ", 1)
+                old_t = parts[0].strip()
+                new_t = parts[1].strip()
                 if old_t:
                     replace_map[old_t] = new_t
         state["replace_map"] = replace_map
@@ -269,9 +253,9 @@ async def cb_aflag(bot: Client, query: CallbackQuery):
         AUTO_STATE[owner_id] = state
         await query.message.edit_text(
             "**Step 5/7** — Text replacements do\n\n"
-            "**Format 1 — Ek line mein multiple:**\n`WatcherGuru : MyCryptoChannel | dark : white`\n\n"
-            "**Format 2 — Alag alag line mein:**\n`WatcherGuru | MyCryptoChannel`\n`dark | white`\n\n"
-            "⚠️ Replace case-insensitive hai (@WatcherGuru, watcherguru sab match hoga)\n\n"
+            "Format: `WatcherGuru : MyCryptoChannel | dark : white`\n"
+"(| se multiple pairs, : se old aur new alag karo)\n\n"
+            "⚠️ Case-insensitive: @WatcherGuru, watcherguru sab match hoga\n\n"
             "`/skip` — koi replacement nahi\n\n"
             "/cancel — cancel"
         )
@@ -618,8 +602,8 @@ async def cb_redit(bot: Client, query: CallbackQuery):
         "affiliate": "🤖 Naya **affiliate bot** @username bhejo\n(`/skip` — remove karne ke liye)",
         "replace"  : (
             "🔄 Naya **replace map** bhejo\n\n"
-            "**Format 1 — Ek line mein multiple:**\n`WatcherGuru : MyCryptoChannel | dark : white`\n\n"
-            "**Format 2 — Alag alag line mein:**\n`WatcherGuru | MyCryptoChannel`\n`dark | white`\n\n"
+            "Format: `WatcherGuru : MyCryptoChannel | dark : white`\n"
+"(| se multiple pairs, : se old aur new alag karo)\n\n"
             "⚠️ Case-insensitive: @WatcherGuru, watcherguru sab match hoga\n\n"
             "`/skip` — replace hata do\n\n/cancel — cancel"
         ),
@@ -714,30 +698,14 @@ async def handle_edit_step(bot: Client, msg: Message):
             # Dono formats support karta hai:
             # Nayi format (ek line): WatcherGuru : MyCryptoChannel | dark : white
             # Purani format (multiline): WatcherGuru | MyCryptoChannel (ek line mein ek pair)
-            all_pairs = []
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                if " : " in line:
-                    # Nayi format — | se multiple pairs alag karo
-                    for pair in line.split("|"):
-                        all_pairs.append(pair)
-                elif "|" in line:
-                    # Purani format — | se old/new alag karo
-                    all_pairs.append(line)
-            for pair in all_pairs:
+            # Format: WatcherGuru : MyCryptoChannel | dark : white
+            for pair in text.split("|"):
                 pair = pair.strip()
-                if " : " in pair:
-                    parts = pair.split(" : ", 1)
-                    old_t = parts[0].strip()
-                    new_t = parts[1].strip()
-                elif "|" in pair:
-                    parts = pair.split("|", 1)
-                    old_t = parts[0].strip()
-                    new_t = parts[1].strip()
-                else:
+                if " : " not in pair:
                     continue
+                parts = pair.split(" : ", 1)
+                old_t = parts[0].strip()
+                new_t = parts[1].strip()
                 if old_t:
                     replace_map[old_t] = new_t
         new_val = replace_map
@@ -756,15 +724,17 @@ async def handle_edit_step(bot: Client, msg: Message):
         return await msg.reply("❌ Rule nahi mila.")
 
     owner_check = rule.get("owner_id")
-    await db.update_rule_field(owner_check, rule_id, field, new_val)
+    # "replace" field DB mein "replace_map" naam se store hoti hai
+    db_field = "replace_map" if field == "replace" else field
+    await db.update_rule_field(owner_check, rule_id, db_field, new_val)
 
     from auto_listener import _rule_map, unregister_rule, register_rule
     if field == "source":
         unregister_rule(rule_id)
-        updated = {**rule, field: new_val}
+        updated = {**rule, db_field: new_val}
         await register_rule(owner_check, updated)
     elif rule_id in _rule_map:
-        _rule_map[rule_id][field] = new_val
+        _rule_map[rule_id][db_field] = new_val
 
     EDIT_STATE.pop(owner_id, None)
 
