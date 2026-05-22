@@ -77,16 +77,33 @@ def _check_trigger_words(text: str, trigger_words: list) -> bool:
     return False
 
 def _should_forward(raw_text: str, rule: dict) -> bool:
+    """
+    Forward Mode logic:
+    - None        : koi limitation nahi, sab forward hoga
+    - only_forward: sirf wahi post forward hogi jisme trigger word ho
+    - not_forward : jis post mein trigger word ho woh forward NAHI hogi
+    """
     mode          = rule.get("specific_forward_mode")
     trigger_words = rule.get("trigger_words", [])
-    if not mode and not trigger_words:
+
+    # None mode — koi filter nahi, sab forward karo
+    if not mode:
         return True
+
+    # Trigger words nahi hain toh mode ka koi matlab nahi — sab forward karo
+    if not trigger_words:
+        return True
+
     matched = _check_trigger_words(raw_text, trigger_words)
+
     if mode == "forward":
+        # Only Forward: sirf tab forward karo jab trigger word match kare
         return matched
     elif mode == "not_forward":
+        # Not Forward: jab trigger word match kare tab forward MAT karo
         return not matched
-    return matched
+
+    return True
 
 
 # ─────────────────────── Lifecycle ───────────────────────────────────────
