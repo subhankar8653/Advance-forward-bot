@@ -1,13 +1,12 @@
 """
-Auto-Listener — v4 All Features Fixed
-=======================================
+Auto-Listener — v5
+===================
 Fixes:
-1. Bold text — HTML parse_mode ke saath send_message/send_photo etc. use karo
-2. Remove thumbnail — sirf caption (text) bhejo, media bilkul mat bhejo
-3. Replace map — processed text hamesha use hoga, copy_message avoid
-4. Hide links / hide usernames — sahi se apply hoga
-5. Peer id invalid — graceful log
-6. FloodWait — retry with sleep
+1. Media group (album) — saari photos ek saath bhejo, alag alag nahi
+2. Replace map — processed text hamesha use hoga
+3. Bold text — HTML parse_mode
+4. Remove thumbnail — sirf text bhejo
+5. Hide links / hide usernames
 """
 import asyncio
 import logging
@@ -16,7 +15,7 @@ import unicodedata
 from pyrogram import Client, enums
 from pyrogram.handlers import MessageHandler
 from pyrogram.filters import channel
-from pyrogram.types import Message
+from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from pyrogram.errors import FloodWait, PeerIdInvalid
 
 from database import db
@@ -28,6 +27,12 @@ logger = logging.getLogger(__name__)
 _handlers:   dict[str, MessageHandler] = {}
 _rule_map:   dict[str, dict]           = {}
 _source_map: dict[int, list[str]]      = {}
+
+# Media group buffer: { "chat_id:media_group_id": [Message, ...] }
+_media_group_buffer: dict[str, list[Message]] = {}
+_media_group_tasks:  dict[str, asyncio.Task]  = {}
+MEDIA_GROUP_WAIT = 1.5  # seconds — saare photos aane ka wait
+
 
 # ─────────────────────── Unicode Normalizer ──────────────────────────────
 
@@ -98,7 +103,6 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
     rule_id   = rule["rule_id"]
     source_id = rule["source_id"]
 
-    # Source change hone par purana handler cleanup
     if rule_id in _rule_map:
         old_source = _rule_map[rule_id].get("source_id")
         if old_source and old_source != source_id:
@@ -134,7 +138,6 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
         fn = await _make_handler(source_id)
         h  = MessageHandler(fn, filters=channel)
         _handlers[handler_key] = h
-
         for oid, slots in _clients.items():
             for c in slots.values():
                 try:
@@ -185,7 +188,6 @@ async def _on_new_message(client: Client, message: Message, source_id: int):
                 stale.remove(rule_id)
             continue
 
-        # DB se fresh rule fetch karo — edit changes turant apply hon
         try:
             fresh_rule = await db.get_rule_by_id(rule_id)
             if fresh_rule:
@@ -199,13 +201,146 @@ async def _on_new_message(client: Client, message: Message, source_id: int):
         owner_slots = _clients.get(owner_id, {})
         use_client  = next(iter(owner_slots.values()), client)
 
-        asyncio.create_task(_process_and_forward(use_client, message, rule))
+        # ── Media group check ──────────────────────────────────
+        if message.media_group_id:
+            buf_key = f"{message.chat.id}:{message.media_group_id}:{rule_id}"
+            _media_group_buffer.setdefault(buf_key, []).append(message)
+
+            # Agar pehle se timer chal raha hai toh cancel karo (naya message aaya)
+            old_task = _media_group_tasks.get(buf_key)
+            if old_task and not old_task.done():
+                old_task.cancel()
+
+            # Naya timer lagao — MEDIA_GROUP_WAIT seconds baad flush
+            task = asyncio.create_task(
+                _flush_media_group(use_client, buf_key, rule)
+            )
+            _media_group_tasks[buf_key] = task
+        else:
+            asyncio.create_task(_process_and_forward(use_client, message, rule))
 
 
-# ─────────────────────── Core Processing ─────────────────────────────────
+# ─────────────────────── Media Group Flush ───────────────────────────────
+
+async def _flush_media_group(client: Client, buf_key: str, rule: dict):
+    """
+    MEDIA_GROUP_WAIT seconds baad saari buffered photos ek saath bhejo.
+    """
+    try:
+        await asyncio.sleep(MEDIA_GROUP_WAIT)
+    except asyncio.CancelledError:
+        return  # Naya message aaya — cancel theek hai
+
+    messages = _media_group_buffer.pop(buf_key, [])
+    _media_group_tasks.pop(buf_key, None)
+
+    if not messages:
+        return
+
+    # Message ID ke order mein sort karo
+    messages.sort(key=lambda m: m.id)
+
+    # Caption wala message dhundo (usually last one)
+    caption_msg = None
+    for m in messages:
+        if m.caption or m.text:
+            caption_msg = m
+            break
+    if caption_msg is None:
+        caption_msg = messages[-1]
+
+    raw_text = caption_msg.caption or caption_msg.text or ""
+
+    # Trigger filter check
+    if not _should_forward(raw_text, rule):
+        return
+
+    hide_links       = rule.get("hide_links", False)
+    hide_usernames   = rule.get("hide_usernames", False)
+    replace_map      = rule.get("replace_map") or {}
+    remove_thumbnail = rule.get("remove_thumbnail", False)
+    bold_text        = rule.get("bold_text", False)
+    targets          = rule["targets"]
+
+    new_text = process_text(
+        raw_text,
+        hide_links=hide_links,
+        hide_usernames=hide_usernames,
+        replace_map=replace_map,
+        bold_text=bold_text,
+    )
+
+    parse_mode = enums.ParseMode.HTML if bold_text else enums.ParseMode.DISABLED
+    has_text   = bool(new_text and new_text.strip())
+
+    for target in targets:
+        try:
+            if remove_thumbnail:
+                # Sirf caption text bhejo — koi media nahi
+                if has_text:
+                    await client.send_message(target, new_text, parse_mode=parse_mode)
+            else:
+                # Saari photos ek album mein bhejo
+                media_list = []
+                for i, msg in enumerate(messages):
+                    # Sirf last (ya caption wale) message mein caption lagao
+                    cap = (new_text if has_text else None) if msg.id == caption_msg.id else None
+                    cap_mode = parse_mode if cap else enums.ParseMode.DISABLED
+
+                    if msg.photo:
+                        media_list.append(InputMediaPhoto(
+                            media=msg.photo.file_id,
+                            caption=cap,
+                            parse_mode=cap_mode,
+                        ))
+                    elif msg.video:
+                        media_list.append(InputMediaVideo(
+                            media=msg.video.file_id,
+                            caption=cap,
+                            parse_mode=cap_mode,
+                            supports_streaming=True,
+                        ))
+                    elif msg.document:
+                        media_list.append(InputMediaDocument(
+                            media=msg.document.file_id,
+                            caption=cap,
+                            parse_mode=cap_mode,
+                        ))
+                    elif msg.audio:
+                        media_list.append(InputMediaAudio(
+                            media=msg.audio.file_id,
+                            caption=cap,
+                            parse_mode=cap_mode,
+                        ))
+
+                if media_list:
+                    await client.send_media_group(chat_id=target, media=media_list)
+                elif has_text:
+                    # Koi media resolve nahi hua — sirf text
+                    await client.send_message(target, new_text, parse_mode=parse_mode)
+
+        except PeerIdInvalid:
+            logger.error(f"❌ Peer invalid: {target} — Userbot ne channel join nahi kiya.")
+        except FloodWait as e:
+            logger.warning(f"FloodWait {e.value}s for target {target}")
+            await asyncio.sleep(e.value + 1)
+            # Simple retry without recursion for media group
+            try:
+                if remove_thumbnail and has_text:
+                    await client.send_message(target, new_text, parse_mode=parse_mode)
+                elif media_list:
+                    await client.send_media_group(chat_id=target, media=media_list)
+            except Exception as e2:
+                logger.error(f"Media group retry failed for {target}: {e2}")
+        except Exception as e:
+            logger.error(f"Media group forward to {target} failed: {e}")
+
+        await asyncio.sleep(1)
+
+
+# ─────────────────────── Core Processing (single message) ────────────────
 
 def _needs_processing(rule: dict) -> bool:
-    """Kya koi bhi text processing rule ON hai?"""
     return bool(
         rule.get("bold_text") or
         rule.get("hide_links") or
@@ -227,7 +362,6 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
     raw_text = message.text or message.caption or ""
 
     if not _should_forward(raw_text, rule):
-        logger.debug(f"Message skipped by trigger filter. Rule: {rule['rule_id']}")
         return
 
     if affiliate_bot:
@@ -241,7 +375,6 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
                 await _send_message(client, processed, target)
             return
 
-    # Text process karo
     new_text = process_text(
         raw_text,
         hide_links=hide_links,
@@ -261,7 +394,7 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
         await asyncio.sleep(1)
 
 
-# ─────────────────────── Forward Logic ───────────────────────────────────
+# ─────────────────────── Forward Single Message ───────────────────────────
 
 async def _forward_one(
     client: Client,
@@ -272,58 +405,24 @@ async def _forward_one(
     bold_text: bool = False,
     needs_processing: bool = False,
 ):
-    """
-    Main forward logic:
-
-    remove_thumbnail=True  → Sirf text/caption bhejo, koi media nahi
-    bold_text=True         → HTML parse_mode ke saath text bhejo
-    needs_processing=True  → Processed text use karo (replace/hide/bold)
-    needs_processing=False → copy_message use karo (original as-is)
-    """
-
-    has_text = bool(new_text and new_text.strip())
+    has_text   = bool(new_text and new_text.strip())
     parse_mode = enums.ParseMode.HTML if bold_text else enums.ParseMode.DISABLED
 
     try:
-
-        # ══════════════════════════════════════════════════════════
-        # CASE 1: Remove Thumbnail ON
-        # Matlab: media hata do, sirf caption text bhejo
-        # Agar caption nahi hai toh kuch nahi bhejo
-        # ══════════════════════════════════════════════════════════
+        # CASE 1: Remove Thumbnail — sirf text bhejo
         if remove_thumbnail:
             if has_text:
-                await client.send_message(
-                    chat_id=target,
-                    text=new_text,
-                    parse_mode=parse_mode,
-                )
-            else:
-                # Media only message tha, caption nahi — skip
-                logger.debug(f"remove_thumbnail=True, no caption — skipping target {target}")
+                await client.send_message(target, new_text, parse_mode=parse_mode)
             return
 
-        # ══════════════════════════════════════════════════════════
-        # CASE 2: Pure text message (koi media nahi)
-        # ══════════════════════════════════════════════════════════
+        # CASE 2: Pure text message
         if not _has_media(message):
             if has_text:
-                await client.send_message(
-                    chat_id=target,
-                    text=new_text,
-                    parse_mode=parse_mode,
-                )
-            # Agar text nahi aur media nahi — kuch nahi karo
+                await client.send_message(target, new_text, parse_mode=parse_mode)
             return
 
-        # ══════════════════════════════════════════════════════════
-        # CASE 3: Media message
-        # Agar koi processing nahi — copy_message se original as-is bhejo
-        # Agar processing hai — media ke saath processed caption bhejo
-        # ══════════════════════════════════════════════════════════
-
+        # CASE 3: Media — koi processing nahi toh copy as-is
         if not needs_processing:
-            # Koi change nahi — original message copy karo
             await client.copy_message(
                 chat_id=target,
                 from_chat_id=message.chat.id,
@@ -331,81 +430,45 @@ async def _forward_one(
             )
             return
 
-        # Processing hai — media bhejo processed caption ke saath
-        caption     = new_text if has_text else None
-        cap_mode    = parse_mode if caption else enums.ParseMode.DISABLED
+        # CASE 4: Media + processing — processed caption ke saath bhejo
+        caption  = new_text if has_text else None
+        cap_mode = parse_mode if caption else enums.ParseMode.DISABLED
 
         if message.photo:
-            await client.send_photo(
-                chat_id=target,
-                photo=message.photo.file_id,
-                caption=caption,
-                parse_mode=cap_mode,
-            )
+            await client.send_photo(target, message.photo.file_id,
+                                    caption=caption, parse_mode=cap_mode)
         elif message.video:
-            await client.send_video(
-                chat_id=target,
-                video=message.video.file_id,
-                caption=caption,
-                parse_mode=cap_mode,
-                supports_streaming=True,
-            )
+            await client.send_video(target, message.video.file_id,
+                                    caption=caption, parse_mode=cap_mode,
+                                    supports_streaming=True)
         elif message.audio:
-            await client.send_audio(
-                chat_id=target,
-                audio=message.audio.file_id,
-                caption=caption,
-                parse_mode=cap_mode,
-            )
+            await client.send_audio(target, message.audio.file_id,
+                                    caption=caption, parse_mode=cap_mode)
         elif message.document:
-            await client.send_document(
-                chat_id=target,
-                document=message.document.file_id,
-                caption=caption,
-                parse_mode=cap_mode,
-            )
+            await client.send_document(target, message.document.file_id,
+                                       caption=caption, parse_mode=cap_mode)
         elif message.animation:
-            await client.send_animation(
-                chat_id=target,
-                animation=message.animation.file_id,
-                caption=caption,
-                parse_mode=cap_mode,
-            )
+            await client.send_animation(target, message.animation.file_id,
+                                        caption=caption, parse_mode=cap_mode)
         elif message.voice:
-            await client.send_voice(
-                chat_id=target,
-                voice=message.voice.file_id,
-                caption=caption,
-                parse_mode=cap_mode,
-            )
+            await client.send_voice(target, message.voice.file_id,
+                                    caption=caption, parse_mode=cap_mode)
         else:
-            # Sticker, video_note — caption nahi hoti, as-is copy
-            await client.copy_message(
-                chat_id=target,
-                from_chat_id=message.chat.id,
-                message_id=message.id,
-            )
+            await client.copy_message(target, message.chat.id, message.id)
 
     except PeerIdInvalid:
-        logger.error(
-            f"❌ Peer invalid: {target} — Userbot ne yeh channel join nahi kiya. "
-            f"Pehle userbot se us channel mein join karo."
-        )
+        logger.error(f"❌ Peer invalid: {target} — Userbot ne channel join nahi kiya.")
     except FloodWait as e:
         logger.warning(f"FloodWait {e.value}s for target {target}")
         await asyncio.sleep(e.value + 1)
-        await _forward_one(
-            client, message, target,
-            new_text=new_text,
-            remove_thumbnail=remove_thumbnail,
-            bold_text=bold_text,
-            needs_processing=needs_processing,
-        )
+        await _forward_one(client, message, target,
+                           new_text=new_text,
+                           remove_thumbnail=remove_thumbnail,
+                           bold_text=bold_text,
+                           needs_processing=needs_processing)
     except Exception as e:
         logger.error(f"Forward to {target} failed: {e}")
 
-
-# ─────────────────────── Media Helper ────────────────────────────────────
 
 def _has_media(message: Message) -> bool:
     return bool(
@@ -419,11 +482,7 @@ def _has_media(message: Message) -> bool:
 
 async def _send_message(client: Client, message: Message, target: int):
     try:
-        await client.copy_message(
-            chat_id=target,
-            from_chat_id=message.chat.id,
-            message_id=message.id,
-        )
+        await client.copy_message(target, message.chat.id, message.id)
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
         await _send_message(client, message, target)
@@ -432,18 +491,16 @@ async def _send_message(client: Client, message: Message, target: int):
         try:
             text = message.text or message.caption or ""
             if message.photo:
-                await client.send_photo(chat_id=target, photo=message.photo.file_id,
-                                        caption=text or None)
+                await client.send_photo(target, message.photo.file_id, caption=text or None)
             elif message.video:
-                await client.send_video(chat_id=target, video=message.video.file_id,
+                await client.send_video(target, message.video.file_id,
                                         caption=text or None, supports_streaming=True)
             elif message.document:
-                await client.send_document(chat_id=target, document=message.document.file_id,
-                                           caption=text or None)
+                await client.send_document(target, message.document.file_id, caption=text or None)
             elif text:
                 await client.send_message(target, text)
         except Exception as e2:
-            logger.error(f"Affiliate forward fallback failed: {e2}")
+            logger.error(f"Affiliate fallback failed: {e2}")
 
 
 async def _affiliate_process(client: Client, original: Message, bot_id) -> Message | None:
@@ -470,18 +527,17 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
     try:
         text_to_send = original.text or original.caption or ""
         if original.photo:
-            await client.send_photo(chat_id=bot_id, photo=original.photo.file_id,
+            await client.send_photo(bot_id, original.photo.file_id,
                                     caption=text_to_send or None)
         elif text_to_send:
             await client.send_message(bot_id, text_to_send)
         elif original.media:
-            await client.copy_message(chat_id=bot_id, from_chat_id=original.chat.id,
-                                      message_id=original.id)
+            await client.copy_message(bot_id, original.chat.id, original.id)
         else:
             return None
         return await asyncio.wait_for(replied, timeout=20)
     except asyncio.TimeoutError:
-        logger.warning(f"Affiliate bot {bot_id} timeout (20s)")
+        logger.warning(f"Affiliate bot {bot_id} timeout")
         return None
     except Exception as e:
         logger.error(f"Affiliate process error: {e}")
@@ -493,7 +549,6 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
 # ─────────────────────── Client Attach ───────────────────────────────────
 
 def attach_client_to_all_handlers(client: Client):
-    """Naya client login → usse sab handlers attach karo."""
     for h in _handlers.values():
         try:
             client.add_handler(h)
