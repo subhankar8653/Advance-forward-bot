@@ -110,6 +110,8 @@ async def add_worker(owner_id: int, token: str) -> str:
     try:
         await live_client.start()
     except Exception as e:
+        # ✅ FIX: Orphan record cleanup — agar live start fail ho toh DB se bhi hatao
+        await db.delete_worker_by_slot(owner_id, slot)
         return f"❌ Live client start failed: {e}"
 
     if owner_id not in _worker_clients:

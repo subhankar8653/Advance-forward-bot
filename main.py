@@ -17,7 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 async def main():
-    os.makedirs(Config.SESSION_DIR, exist_ok=True)
+    try:
+        os.makedirs(Config.SESSION_DIR, exist_ok=True)
+    except OSError:
+        # Railway pe readonly filesystem ho sakta hai — in_memory=True use ho raha hai toh okay hai
+        logger.warning(f"SESSION_DIR '{Config.SESSION_DIR}' create nahi hua — in_memory sessions use honge.")
 
     # ── Start the main Bot ──────────────────────────────────
     bot = Client(

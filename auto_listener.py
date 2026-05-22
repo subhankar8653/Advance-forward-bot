@@ -481,7 +481,7 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
 
 # ─────────────────────── Client Attach ───────────────────────────────────
 
-def attach_client_to_all_handlers(client: Client, owner_id: int = None):
+def attach_client_to_all_handlers(client: Client):
     """Naya client login → usse sab handlers attach karo."""
     for h in _handlers.values():
         try:
