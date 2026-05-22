@@ -24,9 +24,11 @@ from utils import process_text
 
 logger = logging.getLogger(__name__)
 
-_handlers:   dict[str, MessageHandler] = {}
-_rule_map:   dict[str, dict]           = {}
-_source_map: dict[int, list[str]]      = {}
+_handlers:      dict[str, MessageHandler] = {}
+_handler_groups: dict[str, int]          = {}   # handler_key → group number
+_rule_map:      dict[str, dict]           = {}
+_source_map:    dict[int, list[str]]      = {}
+_next_group:    int                       = 10   # group 0-9 reserved, hum 10 se shuru karein
 
 # Media group buffer: { "chat_id:media_group_id": [Message, ...] }
 _media_group_buffer: dict[str, list[Message]] = {}
@@ -127,12 +129,14 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
             if rule_id in old_lst:
                 old_lst.remove(rule_id)
             if not old_lst:
-                h_old = _handlers.pop(f"src_{old_source}", None)
+                old_key = f"src_{old_source}"
+                h_old = _handlers.pop(old_key, None)
+                old_grp = _handler_groups.pop(old_key, 10)
                 if h_old:
                     for slots in _clients.values():
                         for c in slots.values():
                             try:
-                                c.remove_handler(h_old)
+                                c.remove_handler(h_old, old_grp)
                             except Exception:
                                 pass
 
@@ -145,6 +149,11 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
 
     handler_key = f"src_{source_id}"
     if handler_key not in _handlers:
+        global _next_group
+        grp = _next_group
+        _next_group += 1
+        _handler_groups[handler_key] = grp
+
         async def _make_handler(src_id: int):
             async def handler(client: Client, message: Message):
                 if message.chat.id != src_id:
@@ -158,7 +167,7 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
         for oid, slots in _clients.items():
             for c in slots.values():
                 try:
-                    c.add_handler(h)
+                    c.add_handler(h, grp)
                 except Exception:
                     pass
     # Handler already exist karta hai — dobara add mat karo (duplicate fire hoga)
@@ -175,12 +184,14 @@ def unregister_rule(rule_id: str):
     if rule_id in lst:
         lst.remove(rule_id)
     if not lst:
-        h = _handlers.pop(f"src_{source_id}", None)
+        handler_key = f"src_{source_id}"
+        h = _handlers.pop(handler_key, None)
+        grp = _handler_groups.pop(handler_key, 10)
         if h:
             for slots in _clients.values():
                 for c in slots.values():
                     try:
-                        c.remove_handler(h)
+                        c.remove_handler(h, grp)
                     except Exception:
                         pass
     logger.info(f"Rule {rule_id} unregistered")
@@ -559,8 +570,9 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
 # ─────────────────────── Client Attach ───────────────────────────────────
 
 def attach_client_to_all_handlers(client: Client):
-    for h in _handlers.values():
+    for handler_key, h in _handlers.items():
+        grp = _handler_groups.get(handler_key, 10)
         try:
-            client.add_handler(h)
+            client.add_handler(h, grp)
         except Exception:
             pass
