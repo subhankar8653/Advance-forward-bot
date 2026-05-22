@@ -6,6 +6,7 @@ Text processing utilities:
 - Bold text apply (Telegram HTML bold)
 """
 import re
+import html
 
 
 # ──────────────────────────── REGEX PATTERNS ────────────────────────────
@@ -17,8 +18,9 @@ _USERNAME_RE = re.compile(r'@[A-Za-z0-9_]{3,}')
 
 def make_bold(text: str) -> str:
     """
-    Pure text ko Telegram HTML bold mein wrap karo.
-    Line by line bold karta hai taaki formatting sahi rahe.
+    Text ko Telegram HTML bold mein wrap karo.
+    HTML special chars (<, >, &) pehle escape karo — warna parse error aata hai.
+    Line by line bold karta hai.
     """
     if not text:
         return text
@@ -27,30 +29,33 @@ def make_bold(text: str) -> str:
     for line in lines:
         stripped = line.strip()
         if stripped:
-            bold_lines.append(f"<b>{line}</b>")
+            # HTML escape karo pehle (< > & → &lt; &gt; &amp;)
+            safe = html.escape(line)
+            bold_lines.append(f"<b>{safe}</b>")
         else:
-            bold_lines.append(line)  # Empty lines as-is rakhna
+            bold_lines.append(line)  # Empty lines as-is
     return "\n".join(bold_lines)
 
 
 def process_text(
     text: str,
-    hide_links: bool       = False,
-    hide_usernames: bool   = False,
-    replace_map: dict      = None,   # {old_str: new_str}
-    bold_text: bool        = False,  # NEW: text bold karna
+    hide_links: bool     = False,
+    hide_usernames: bool = False,
+    replace_map: dict    = None,   # {old_str: new_str}
+    bold_text: bool      = False,
 ) -> str:
     """
-    Text ko clean karo rules ke hisab se.
-    replace_map pehle apply hoga, phir hide rules, phir bold.
+    Text ko process karo rules ke hisab se.
+    Order: replace → hide links → hide usernames → bold
     """
     if not text:
         return text
 
-    # 1. Custom replacements (e.g. source channel link → apna link)
+    # 1. Custom replacements (pehle — taaki replaced text pe bhi hide kaam kare)
     if replace_map:
         for old, new in replace_map.items():
-            text = text.replace(old, new)
+            if old:  # Empty key skip karo
+                text = text.replace(old, new)
 
     # 2. Telegram links hide
     if hide_links:
@@ -64,7 +69,7 @@ def process_text(
     # Clean extra blank lines
     text = re.sub(r'\n{3,}', '\n\n', text).strip()
 
-    # 4. Bold text wrap (sabse aakhir mein)
+    # 4. Bold wrap (sabse aakhir mein — HTML escape bhi yahan hoti hai)
     if bold_text:
         text = make_bold(text)
 
@@ -72,9 +77,4 @@ def process_text(
 
 
 def clean_entities(message):
-    """
-    Pyrogram Message se text + entities nikalo.
-    Return karo processed text (entities ignore karne ke liye
-    copy_message use karo — yahan plain text return hoga).
-    """
     return message.text or message.caption or ""
