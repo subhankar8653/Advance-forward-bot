@@ -203,7 +203,8 @@ async def handle_auto_step(bot: Client, msg: Message):
         if text.lower() in ("skip", "/skip"):
             state["trigger_words"] = []
         else:
-            words = [w.strip().lower() for w in text.split(",") if w.strip()]
+            # Format: blue : ᖴᖇIᗪᗩY : black : hanuman (: se alag karo)
+            words = [w.strip().lower() for w in text.split(":") if w.strip()]
             state["trigger_words"] = words
 
         AUTO_STATE.pop(owner_id, None)
@@ -299,10 +300,12 @@ async def cb_sfwd(bot: Client, query: CallbackQuery):
 
     mode_label = "sirf yahi forward honge" if choice == "forward" else "yeh forward NAHI honge"
     await query.message.edit_text(
-        f"**Step 7/7** — Trigger words bhejo (comma se alag)\n\n"
-        f"Jab message mein yeh word hoga → {mode_label}\n"
-        f"(Stylish font bhi detect hoga automatically)\n\n"
-        "Example: `Sunday, Monday, crypto`\n\n"
+        f"**Step 7/7** — Trigger words bhejo\n\n"
+        f"Forward Mode: **{'Only Forward' if choice == 'forward' else 'Not Forward'}**\n"
+        f"→ {mode_label}\n\n"
+        "Format: `blue : ᖴᖇIᗪᗩY : black : hanuman`\n"
+        "(: se multiple words alag karo)\n\n"
+        "✅ Stylish font bhi detect hoga automatically\n\n"
         "`/skip` — koi trigger word nahi (sab messages forward honge)\n\n"
         "/cancel — cancel"
     )
@@ -608,10 +611,10 @@ async def cb_redit(bot: Client, query: CallbackQuery):
             "`/skip` — replace hata do\n\n/cancel — cancel"
         ),
         "triggers" : (
-            "⚡ **Trigger words** bhejo (comma se alag)\n\n"
-            "Example: `monday, tuesday, crypto`\n\n"
-            "Jab bhi source channel mein koi word match karega\n"
-            "(stylish font bhi detect hoga automatically)\n\n"
+            "⚡ **Trigger words** bhejo\n\n"
+            "Format: `blue : ᖴᖇIᗪᗩY : black : hanuman`\n"
+            "(: se multiple words alag karo)\n\n"
+            "✅ Stylish font bhi detect hoga automatically\n\n"
             "`/skip` — trigger words hata do (sab messages forward honge)\n\n"
             "/cancel — cancel"
         ),
@@ -714,7 +717,8 @@ async def handle_edit_step(bot: Client, msg: Message):
         if text.lower() in ("skip", "/skip"):
             new_val = []
         else:
-            words = [w.strip().lower() for w in text.split(",") if w.strip()]
+            # Format: blue : ᖴᖇIᗪᗩY : black : hanuman (: se alag karo)
+            words = [w.strip().lower() for w in text.split(":") if w.strip()]
             new_val = words
 
     # DB update
