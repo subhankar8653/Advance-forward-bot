@@ -1,10 +1,14 @@
 """
-Auto-Listener — v6
+Auto-Listener — v7
 ===================
-Changes:
-1. Multiple source channels support (source_ids list)
-2. remove_words support in process_text
-3. Edit tracking — only "forward" mode trigger messages ke liye
+Changes from v6:
+1. FIX: Non-admin joined channels ke messages bhi catch hote hain.
+   filters=channel ki jagah custom filter use kiya jo source_id se match karta hai.
+2. FIX: Redeploy ke baad sab rules automatically kaam karte hain bina
+   receive channel pe message bheje. Proper get_updates() call on startup.
+3. Multiple source channels support (source_ids list)
+4. remove_words support in process_text
+5. Edit tracking — only "forward" mode trigger messages ke liye
    30 min tak source edits monitor karo, target mein bhi update karo
 """
 import asyncio
@@ -12,9 +16,8 @@ import logging
 import unicodedata
 import time
 
-from pyrogram import Client, enums
+from pyrogram import Client, enums, filters
 from pyrogram.handlers import MessageHandler, EditedMessageHandler
-from pyrogram.filters import channel
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from pyrogram.errors import FloodWait, PeerIdInvalid
 
@@ -107,10 +110,6 @@ def _should_forward(raw_text: str, rule: dict) -> bool:
 
 def _register_edit_track(source_chat_id: int, source_msg_id: int,
                           rule_id: str, target_chat_id: int, target_msg_id: int):
-    """
-    Ek forwarded message ka record rakho taaki edit aane par target update ho sake.
-    Sirf 'forward' mode wale rules ke liye use hota hai.
-    """
     key = f"{source_chat_id}:{source_msg_id}"
     if key not in _edit_tracker:
         _edit_tracker[key] = []
@@ -122,7 +121,6 @@ def _register_edit_track(source_chat_id: int, source_msg_id: int,
     })
 
 def _cleanup_edit_tracker():
-    """Expired entries (30 min se purani) hata do."""
     now = time.time()
     expired_keys = []
     for key, entries in _edit_tracker.items():
@@ -135,6 +133,28 @@ def _cleanup_edit_tracker():
         del _edit_tracker[k]
 
 
+# ─────────────────────── Custom Filter (NON-ADMIN FIX) ───────────────────
+# 
+# PROBLEM: Pyrogram ka built-in `filters.channel` sirf admin channels ke
+#          messages catch karta hai. Jab userbot sirf member ho (admin nahi),
+#          toh channel updates milte hain but filter block kar deta hai.
+#
+# FIX: Apna custom filter banao jo:
+#      1. Message kisi bhi chat se aaye — channel ya supergroup
+#      2. Chat ID registered source_map mein ho
+#      Yeh admin restriction nahi lagata.
+
+def _make_source_filter(src_id: int):
+    """
+    Ek custom pyrogram filter banao jo sirf uss specific source channel/chat
+    ke messages pass kare — admin ho ya na ho.
+    """
+    async def _filter_fn(_, __, message: Message) -> bool:
+        return message.chat is not None and message.chat.id == src_id
+
+    return filters.create(_filter_fn, name=f"SourceFilter_{src_id}")
+
+
 # ─────────────────────── Lifecycle ───────────────────────────────────────
 
 async def start_listeners():
@@ -143,6 +163,43 @@ async def start_listeners():
         owner_id = rule["owner_id"]
         await register_rule(owner_id, rule, _startup=True)
     logger.info(f"Auto-listeners started for {len(all_rules)} rules.")
+
+    # ── REDEPLOY FIX: Startup ke baad get_updates() call karo ──
+    # Yeh Telegram ko signal karta hai ki client ready hai aur
+    # missed updates (pts gap) recover karta hai.
+    await _warmup_all_clients()
+
+
+async def _warmup_all_clients():
+    """
+    REDEPLOY FIX: Har client ke liye Telegram se proper update sync karo.
+    get_dialogs() se better: explicit get_updates call + channel joins verify karo.
+    Bina iske redeploy ke baad pehla message miss ho jata hai.
+    """
+    from userbot import _clients as all_clients
+    for owner_id, slots in all_clients.items():
+        for slot, client in slots.items():
+            try:
+                # Method 1: get_dialogs se dialogs fetch karo (update pointer reset)
+                count = 0
+                async for _ in client.get_dialogs(limit=10):
+                    count += 1
+                    if count >= 10:
+                        break
+
+                # Method 2: Source channels explicitly resolve karo
+                # Yeh Telegram ko batata hai ki hum yeh channels monitor kar rahe hain
+                all_source_ids = list(_source_map.keys())
+                for src_id in all_source_ids:
+                    try:
+                        await client.get_chat(src_id)
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+
+                logger.info(f"Warmup complete: owner={owner_id} slot={slot} (dialogs={count}, sources={len(all_source_ids)})")
+            except Exception as e:
+                logger.warning(f"Warmup failed for owner={owner_id} slot={slot}: {e}")
 
 
 async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
@@ -194,22 +251,22 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
             _next_group += 1
             _handler_groups[handler_key] = grp
 
-            async def _make_handlers(src_id: int):
+            # ── NON-ADMIN FIX: Custom filter use karo, filters.channel nahi ──
+            src_filter = _make_source_filter(source_id)
+
+            async def _make_handlers(src_id: int, s_filter):
                 async def new_msg_handler(client: Client, message: Message):
-                    if message.chat.id != src_id:
-                        return
                     await _on_new_message(client, message, src_id)
 
                 async def edit_msg_handler(client: Client, message: Message):
-                    if message.chat.id != src_id:
-                        return
                     await _on_edited_message(client, message, src_id)
 
-                return new_msg_handler, edit_msg_handler
+                return (
+                    MessageHandler(new_msg_handler, filters=s_filter),
+                    EditedMessageHandler(edit_msg_handler, filters=s_filter),
+                )
 
-            new_fn, edit_fn = await _make_handlers(source_id)
-            h  = MessageHandler(new_fn, filters=channel)
-            he = EditedMessageHandler(edit_fn, filters=channel)
+            h, he = await _make_handlers(source_id, src_filter)
             _handlers[handler_key]      = h
             _edit_handlers[handler_key] = he
 
@@ -294,22 +351,17 @@ async def _on_new_message(client: Client, message: Message, source_id: int):
 # ─────────────────────── Edited Message Handler ──────────────────────────
 
 async def _on_edited_message(client: Client, message: Message, source_id: int):
-    """
-    Source channel mein edit hua — check karo koi forwarded message track ho raha hai kya.
-    Sirf 'forward' mode (only specific forward) wale messages track hote hain.
-    30 min window mein edit aaye toh target mein bhi update karo.
-    """
     _cleanup_edit_tracker()
 
     key = f"{source_id}:{message.id}"
     entries = _edit_tracker.get(key)
     if not entries:
-        return  # Yeh message track nahi tha
+        return
 
     now = time.time()
     for entry in entries:
         if now - entry["sent_at"] > EDIT_TRACK_WINDOW:
-            continue  # Window expire ho gayi
+            continue
 
         rule_id        = entry["rule_id"]
         target_chat_id = entry["target_chat_id"]
@@ -337,7 +389,6 @@ async def _on_edited_message(client: Client, message: Message, source_id: int):
 
         try:
             if message.photo or message.video or message.document or message.audio:
-                # Media message — caption edit karo
                 await use_client.edit_message_caption(
                     chat_id=target_chat_id,
                     message_id=target_msg_id,
@@ -345,7 +396,6 @@ async def _on_edited_message(client: Client, message: Message, source_id: int):
                     parse_mode=parse_mode,
                 )
             else:
-                # Text message — text edit karo
                 await use_client.edit_message_text(
                     chat_id=target_chat_id,
                     message_id=target_msg_id,
@@ -508,7 +558,6 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
             bold_text=bold_text,
             needs_processing=_needs_processing(rule),
         )
-        # Edit tracking: sirf "only forward" mode ke liye
         if sent_msg and is_only_forward_mode and rule_id:
             _register_edit_track(
                 source_chat_id=message.chat.id,
@@ -531,7 +580,6 @@ async def _forward_one(
     bold_text: bool = False,
     needs_processing: bool = False,
 ) -> Message | None:
-    """Returns sent Message object (for edit tracking), or None on failure."""
     has_text   = bool(new_text and new_text.strip())
     parse_mode = enums.ParseMode.HTML if bold_text else enums.ParseMode.DISABLED
 

@@ -32,10 +32,6 @@ async def get_client(owner_id: int) -> Client | None:
 
 
 async def get_all_clients(owner_id: int) -> list[tuple[int, Client]]:
-    """
-    [(slot, Client), ...] sorted by slot.
-    Forwarding mein saare use hote hain.
-    """
     slots = _clients.get(owner_id, {})
     return sorted(slots.items())
 
@@ -68,12 +64,18 @@ async def start_all_clients():
             me = await client.get_me()
             logger.info(f"Userbot started: owner={owner_id} slot={slot} name={me.first_name}")
 
-            # Warmup: Telegram ko signal do ki client active hai
-            # Bina iske redeploy ke baad updates nahi aate jab tak koi message na ho
+            # ── REDEPLOY FIX: Proper warmup ──────────────────────────────
+            # Problem: Redeploy ke baad Telegram updates nahi bhejta until
+            #          koi event trigger ho (like message send karna).
+            # Fix: get_dialogs() + explicit source channel resolve = Telegram
+            #      ko pata chalta hai ki client active hai aur updates bhejni chahiye.
             try:
-                async for _ in client.get_dialogs(limit=5):
-                    break
-                logger.info(f"Warmup done: owner={owner_id} slot={slot}")
+                count = 0
+                async for _ in client.get_dialogs(limit=15):
+                    count += 1
+                    if count >= 15:
+                        break
+                logger.info(f"Warmup done: owner={owner_id} slot={slot} (fetched {count} dialogs)")
             except Exception as warm_err:
                 logger.warning(f"Warmup failed (non-critical): owner={owner_id} slot={slot}: {warm_err}")
 
@@ -84,12 +86,7 @@ async def start_all_clients():
 # ─────────────────────── Logout ──────────────────────────────────────────
 
 async def logout(owner_id: int, slot: int | None = None) -> str:
-    """
-    slot=None → saare accounts logout
-    slot=N    → sirf woh account logout
-    """
     if slot is None:
-        # Saare
         slots_dict = _clients.pop(owner_id, {})
         for s, client in slots_dict.items():
             try:
@@ -99,7 +96,6 @@ async def logout(owner_id: int, slot: int | None = None) -> str:
         await db.delete_userbot(owner_id)
         return f"✅ Saare {len(slots_dict)} account(s) logout ho gaye."
     else:
-        # Specific slot
         slots_dict = _clients.get(owner_id, {})
         client = slots_dict.pop(slot, None)
         if not client:
@@ -109,7 +105,6 @@ async def logout(owner_id: int, slot: int | None = None) -> str:
         except Exception:
             pass
         await db.delete_userbot_by_slot(owner_id, slot)
-        # Slots re-number karo memory mein bhi
         new_dict = {i: c for i, (_, c) in enumerate(sorted(slots_dict.items()))}
         _clients[owner_id] = new_dict
         return f"✅ Account slot {slot} remove ho gaya."
@@ -118,17 +113,12 @@ async def logout(owner_id: int, slot: int | None = None) -> str:
 # ─────────────────────── Login Flow ──────────────────────────────────────
 
 class LoginSession:
-    """
-    Multi-account login support.
-    State: { client, phone, phone_code_hash, step }
-    """
-    _pending: dict[int, dict] = {}  # { owner_id: {...} }
+    _pending: dict[int, dict] = {}
 
     @classmethod
     async def start_login(cls, owner_id: int, phone: str) -> str:
         os.makedirs(Config.SESSION_DIR, exist_ok=True)
 
-        # Check: kya yeh phone pehle se logged in hai?
         existing_accounts = await db.get_all_userbots(owner_id)
         for acc in existing_accounts:
             if acc["phone"] == phone:
@@ -170,7 +160,7 @@ class LoginSession:
             await client.sign_in(
                 phone_number    = pending["phone"],
                 phone_code_hash = pending["phone_code_hash"],
-                phone_code      = "".join(code.split())  # spaces remove karo (5 0 8 9 7 → 50897)
+                phone_code      = "".join(code.split())
             )
         except PhoneCodeInvalid:
             return "❌ Galat OTP. Dobara bhejo."
@@ -203,7 +193,6 @@ class LoginSession:
 
     @classmethod
     async def _finish_login(cls, owner_id: int, client: Client, phone: str) -> str:
-        # Step 1: Session export
         try:
             session_string = await client.export_session_string()
         except Exception as e:
@@ -214,20 +203,17 @@ class LoginSession:
             cls._pending.pop(owner_id, None)
             return f"❌ Session export failed: {e}"
 
-        # Step 2: Temp client disconnect
         try:
             await client.disconnect()
         except Exception:
             pass
 
-        # Step 3: DB save (yahan KeyError fix hai database.py mein)
         try:
             slot = await db.save_userbot(owner_id, phone, session_string)
         except Exception as e:
             cls._pending.pop(owner_id, None)
             return f"❌ DB save failed: {e}"
 
-        # Step 4: Live client start
         live_client = Client(
             name=f"user_{owner_id}_{slot}",
             api_id=Config.API_ID,
@@ -246,7 +232,6 @@ class LoginSession:
         _clients[owner_id][slot] = live_client
 
         # ✅ FIX: Login ke baad is owner ke saare rule targets join karo
-        # Bina join ke "Peer id invalid" error aata hai
         try:
             from database import db as _db
             rules = await _db.get_auto_rules(owner_id)
@@ -266,6 +251,17 @@ class LoginSession:
             attach_client_to_all_handlers(live_client)
         except Exception as e:
             logger.warning(f"attach handlers failed: {e}")
+
+        # ✅ REDEPLOY FIX: Naye login ke baad bhi warmup karo
+        try:
+            count = 0
+            async for _ in live_client.get_dialogs(limit=15):
+                count += 1
+                if count >= 15:
+                    break
+            logger.info(f"New login warmup done: owner={owner_id} slot={slot}")
+        except Exception as e:
+            logger.warning(f"New login warmup failed: {e}")
 
         cls._pending.pop(owner_id, None)
         me = await live_client.get_me()
