@@ -4,6 +4,7 @@ Text processing utilities:
 - @username hide/replace
 - Custom find-replace
 - Bold text apply (Telegram HTML bold)
+- Remove words (specific words delete karo)
 """
 import re
 import html
@@ -43,13 +44,22 @@ def process_text(
     hide_usernames: bool = False,
     replace_map: dict    = None,   # {old_str: new_str}
     bold_text: bool      = False,
+    remove_words: list   = None,   # [word1, word2, ...] — ye words delete ho jayenge
 ) -> str:
     """
     Text ko process karo rules ke hisab se.
-    Order: replace → hide links → hide usernames → bold
+    Order: remove_words → replace → hide links → hide usernames → bold
     """
     if not text:
         return text
+
+    # 0. Remove words (pehle — taaki baaki processing pe effect na pade)
+    # Case-insensitive: "blue" likhoge toh "Blue", "BLUE" sab hat jayega
+    if remove_words:
+        for word in remove_words:
+            word = word.strip()
+            if word:
+                text = re.sub(re.escape(word), '', text, flags=re.IGNORECASE)
 
     # 1. Custom replacements (pehle — taaki replaced text pe bhi hide kaam kare)
     # Case-insensitive replace — WatcherGuru, @WatcherGuru, watcherguru sab match hoga

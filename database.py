@@ -108,34 +108,41 @@ class Database:
     # ────────────────────────── AUTO RULES ─────────────────────────────
     # Rule schema (full):
     # {
-    #   rule_id, owner_id, source_id, targets,
+    #   rule_id, owner_id, source_ids (list), targets,
     #   affiliate_bot,
     #   hide_links, hide_usernames,
-    #   remove_thumbnail,        ← NEW: thumbnail hatana (bool)
-    #   bold_text,               ← NEW: text bold karna (bool)
+    #   remove_thumbnail,        ← bool
+    #   bold_text,               ← bool
     #   replace_map,
-    #   specific_forward_mode,   ← NEW: "forward" | "not_forward" | None
-    #   trigger_words,           ← NEW: list of words
+    #   remove_words,            ← NEW: list of words to delete from forwarded text
+    #   specific_forward_mode,   ← "forward" | "not_forward" | None
+    #   trigger_words,           ← list of words
     # }
 
     async def add_auto_rule(self, owner_id: int, rule: dict):
         rule["owner_id"] = owner_id
         # Naye fields ka default set karo agar missing ho
-        # (purane rules ke saath backward compatible)
         rule.setdefault("remove_thumbnail",      False)
         rule.setdefault("bold_text",             False)
         rule.setdefault("specific_forward_mode", None)
         rule.setdefault("trigger_words",         [])
+        rule.setdefault("remove_words",          [])   # NEW
+        # source_id → source_ids migration (backward compat)
+        if "source_id" in rule and "source_ids" not in rule:
+            rule["source_ids"] = [rule["source_id"]]
         await self.auto_rules.insert_one(rule)
 
     async def get_auto_rules(self, owner_id: int):
         rules = [r async for r in self.auto_rules.find({"owner_id": owner_id})]
-        # Purane rules ke liye missing fields ka default dena
         for r in rules:
             r.setdefault("remove_thumbnail",      False)
             r.setdefault("bold_text",             False)
             r.setdefault("specific_forward_mode", None)
             r.setdefault("trigger_words",         [])
+            r.setdefault("remove_words",          [])   # NEW
+            # Backward compat: purane rules mein source_id tha
+            if "source_ids" not in r and "source_id" in r:
+                r["source_ids"] = [r["source_id"]]
         return rules
 
     async def get_rule_by_id(self, rule_id: str):
@@ -145,6 +152,9 @@ class Database:
             r.setdefault("bold_text",             False)
             r.setdefault("specific_forward_mode", None)
             r.setdefault("trigger_words",         [])
+            r.setdefault("remove_words",          [])   # NEW
+            if "source_ids" not in r and "source_id" in r:
+                r["source_ids"] = [r["source_id"]]
         return r
 
     async def delete_auto_rule(self, owner_id: int, rule_id: str):
@@ -157,6 +167,9 @@ class Database:
             r.setdefault("bold_text",             False)
             r.setdefault("specific_forward_mode", None)
             r.setdefault("trigger_words",         [])
+            r.setdefault("remove_words",          [])   # NEW
+            if "source_ids" not in r and "source_id" in r:
+                r["source_ids"] = [r["source_id"]]
         return rules
 
     # ────────────────────────── MANUAL TASKS ───────────────────────────
