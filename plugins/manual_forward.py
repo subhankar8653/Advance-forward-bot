@@ -743,6 +743,17 @@ async def _run_multi_forward(
     done = skipped = filtered = 0
     PROGRESS_EVERY = 5   # har 5 rounds pe update
 
+    # ── Dynamic sleep: bots jitne zyada, utna kam sleep ─────────────────
+    # 1 bot → 1.0s | 2-3 bots → 0.7s | 4-6 bots → 0.5s | 7+ bots → 0.3s
+    if n >= 7:
+        ROUND_SLEEP = 0.3
+    elif n >= 4:
+        ROUND_SLEEP = 0.5
+    elif n >= 2:
+        ROUND_SLEEP = 0.7
+    else:
+        ROUND_SLEEP = 1.0
+
     if n > 1:
         # ── GROUPED ROUND-ROBIN (Worker Bots) ───────────────────────────
         # Messages ko N-size groups mein tod do
@@ -807,8 +818,8 @@ async def _run_multi_forward(
                     f"/stop — cancel"
                 )
 
-            # 1 second gap har round ke baad (Telegram rate limit safety)
-            await asyncio.sleep(1)
+            # Dynamic sleep — bots ki sankhya ke hisaab se
+            await asyncio.sleep(ROUND_SLEEP)
 
         cancelled = _active.get(master_id, {}).get("cancelled", False)
         if cancelled:
