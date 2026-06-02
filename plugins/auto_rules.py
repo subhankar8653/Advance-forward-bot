@@ -78,6 +78,14 @@ async def handle_auto_step(bot: Client, msg: Message):
             origin = msg.forward_origin
             if hasattr(origin, "chat") and origin.chat:
                 source_id = origin.chat.id
+            # MessageOriginChannel: sender_chat bhi check karo (newer Pyrogram versions)
+            elif hasattr(origin, "sender_chat") and origin.sender_chat:
+                source_id = origin.sender_chat.id
+
+        # Restricted channel: forward_sender_name se message aata hai (no chat info)
+        # Lekin agar userbot us channel mein hai, toh msg.sender_chat se ID milti hai
+        if not source_id and hasattr(msg, "sender_chat") and msg.sender_chat:
+            source_id = msg.sender_chat.id
 
         if not source_id and text:
             m = re.search(r't\.me/(?:c/)?(\-?\d+|[A-Za-z0-9_]+)', text)
@@ -102,17 +110,20 @@ async def handle_auto_step(bot: Client, msg: Message):
             hint = ""
             if msg.forward_sender_name or (hasattr(msg, "forward_origin") and msg.forward_origin):
                 hint = (
-                    "\n\n⚠️ **Restricted channel detected!**\n"
-                    "Is channel ne forwarding restrict ki hui hai.\n"
-                    "Channel ID manually bhejo:\n"
+                    "\n\n⚠️ **Forward-Restricted Channel Detected!**\n"
+                    "Is channel ne forwarding restrict ki hui hai — ID auto-detect nahi ho sakti.\n\n"
+                    "**Option 1** — Seedha ID bhejo:\n"
+                    "`-1001234567890` (numeric ID)\n\n"
+                    "**Option 2** — @userinfobot se pata karo:\n"
                     "1. @userinfobot pe jaao\n"
                     "2. Us channel ka koi message forward karo wahan\n"
-                    "3. Jo ID mile woh yahan bhejo\n"
+                    "3. Jo ID mile woh yahan bhejo\n\n"
+                    "**Option 3** — Channel link bhejo:\n"
+                    "`https://t.me/channelname` ya `https://t.me/c/1234567890/1`\n"
                 )
             return await msg.reply(
                 "❌ Channel detect nahi hua." + hint +
-                "\n\nYa seedha channel link bhejo:\n`https://t.me/channelname`\n\n"
-                "/cancel — cancel"
+                "\n\n/cancel — cancel"
             )
 
         # Duplicate check
