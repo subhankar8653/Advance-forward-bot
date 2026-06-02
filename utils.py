@@ -20,7 +20,9 @@ _USERNAME_RE = re.compile(r'@[A-Za-z0-9_]{3,}')
 def make_bold(text: str) -> str:
     """
     Text ko Telegram HTML bold mein wrap karo.
-    HTML special chars (<, >, &) pehle escape karo — warna parse error aata hai.
+    Sirf < > & escape hote hain (Telegram HTML ke liye zaroori).
+    ' aur " escape NAHI hote — Telegram parser &#x27; reject karta hai
+    aur pura message plain text ho jaata hai (bold fail).
     Line by line bold karta hai.
     """
     if not text:
@@ -30,8 +32,8 @@ def make_bold(text: str) -> str:
     for line in lines:
         stripped = line.strip()
         if stripped:
-            # HTML escape karo pehle (< > & → &lt; &gt; &amp;)
-            safe = html.escape(line)
+            # quote=False: sirf < > & escape hote hain, ' " nahi
+            safe = html.escape(line, quote=False)
             bold_lines.append(f"<b>{safe}</b>")
         else:
             bold_lines.append(line)  # Empty lines as-is

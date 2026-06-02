@@ -307,19 +307,8 @@ async def _on_new_message(client: Client, message: Message, source_id: int):
                 stale.remove(rule_id)
             continue
 
-        # FIX #2: Fresh DB se sirf config fields update karo
-        # owner_id aur source_ids cached rule se preserve karo
-        try:
-            fresh_rule = await db.get_rule_by_id(rule_id)
-            if fresh_rule:
-                # Critical fields cached se preserve karo
-                fresh_rule["owner_id"]   = rule["owner_id"]
-                fresh_rule["source_ids"] = rule["source_ids"]
-                _rule_map[rule_id] = fresh_rule
-                rule = fresh_rule
-        except Exception as e:
-            logger.warning(f"DB fetch failed for rule {rule_id}, using cached: {e}")
-
+        # Use cached rule directly — DB fetch every message pe nahi karna
+        # Rule update hone pe cb_redit/handle_edit_step _rule_map update karta hai
         owner_id    = rule["owner_id"]
         owner_slots = _clients.get(owner_id, {})
         use_client  = next(iter(owner_slots.values()), client)
