@@ -777,6 +777,8 @@ async def handle_edit_step(bot: Client, msg: Message):
         "triggers"    : "trigger_words",
         "source"      : "source_ids",
         "remove_words": "remove_words",
+        "affiliate"   : "affiliate_bot",   # BUG FIX: DB field "affiliate_bot" hai
+        "targets"     : "targets",
     }
     db_field = _field_map.get(field, field)
 

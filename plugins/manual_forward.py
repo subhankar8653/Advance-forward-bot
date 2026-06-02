@@ -689,16 +689,23 @@ async def _forward_one(client, source, target, msg_id,
             return "filter"
 
         if hide_lnk or hide_usr:
+            from pyrogram import enums as _enums
             raw = fetched.text or fetched.caption or ""
             new_text = process_text(raw, hide_links=hide_lnk, hide_usernames=hide_usr)
             if fetched.media:
+                # BUG FIX: parse_mode=DISABLED — processed text plain hai, HTML nahi
                 await client.copy_message(
                     chat_id=target, from_chat_id=source,
-                    message_id=msg_id, caption=new_text or None
+                    message_id=msg_id,
+                    caption=new_text or None,
+                    parse_mode=_enums.ParseMode.DISABLED,
                 )
             else:
                 if new_text:
-                    await client.send_message(target, new_text)
+                    await client.send_message(
+                        target, new_text,
+                        parse_mode=_enums.ParseMode.DISABLED,
+                    )
                 else:
                     return "skip"
         else:

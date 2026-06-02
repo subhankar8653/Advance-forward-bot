@@ -42,11 +42,15 @@ async def cb_clearrules(bot: Client, query: CallbackQuery):
     # DB se saare rules delete karo
     await db.auto_rules.delete_many({})
 
-    # In-memory cache reset karo
-    from auto_listener import _rule_map, _source_map, _handlers
+    # In-memory cache reset karo — SAARE dicts clear karo
+    from auto_listener import (
+        _rule_map, _source_map, _handlers, _edit_handlers, _handler_groups
+    )
     _rule_map.clear()
     _source_map.clear()
     _handlers.clear()
+    _edit_handlers.clear()     # BUG FIX: edit handlers bhi clear karo
+    _handler_groups.clear()    # BUG FIX: group numbers bhi reset karo
 
     await query.message.edit_text(
         "✅ **Saare auto-forward rules delete ho gaye!**\n\n"
@@ -94,11 +98,15 @@ async def cb_cleardb(bot: Client, query: CallbackQuery):
     await db.tasks.delete_many({})
     # users table rehne do (bas reset)
 
-    # In-memory listeners bhi clear karo
-    from auto_listener import _rule_map, _source_map, _handlers
+    # In-memory listeners bhi clear karo — SAARE dicts
+    from auto_listener import (
+        _rule_map, _source_map, _handlers, _edit_handlers, _handler_groups
+    )
     _rule_map.clear()
     _source_map.clear()
     _handlers.clear()
+    _edit_handlers.clear()     # BUG FIX: edit handlers bhi clear karo
+    _handler_groups.clear()    # BUG FIX: group numbers bhi reset karo
 
     await query.message.edit_text(
         "💣 **Pura database wipe ho gaya!**\n\n"
