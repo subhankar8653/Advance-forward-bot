@@ -21,7 +21,7 @@ import time
 from pyrogram import Client, enums, filters
 from pyrogram.handlers import MessageHandler, EditedMessageHandler
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
-from pyrogram.errors import FloodWait, PeerIdInvalid
+from pyrogram.errors import FloodWait, PeerIdInvalid, ChatForwardsRestricted
 
 from database import db
 from userbot import _clients
@@ -480,6 +480,16 @@ async def _flush_media_group(client: Client, buf_key: str, rule: dict):
 
         except PeerIdInvalid:
             logger.error(f"❌ Peer invalid: {target}")
+        except ChatForwardsRestricted:
+            # Media group mein file_id se hi send hota hai — yeh error nahi aana chahiye
+            # Agar aaya toh individual messages ko _send_restricted_media se bhejo
+            logger.info(f"Media group forward-restricted for target {target} — individual fallback")
+            parse_mode_mg = enums.ParseMode.HTML if bold_text else enums.ParseMode.DISABLED
+            for msg in messages:
+                cap = (new_text if has_text else None) if msg.id == caption_msg.id else None
+                await _send_restricted_media(client, msg, target,
+                                             caption=cap, parse_mode=parse_mode_mg)
+                await asyncio.sleep(0.5)
         except FloodWait as e:
             logger.warning(f"FloodWait {e.value}s for target {target}")
             await asyncio.sleep(e.value + 1)
@@ -585,11 +595,19 @@ async def _forward_one(
             return None
 
         if not needs_processing:
-            return await client.copy_message(
-                chat_id=target,
-                from_chat_id=message.chat.id,
-                message_id=message.id,
-            )
+            try:
+                return await client.copy_message(
+                    chat_id=target,
+                    from_chat_id=message.chat.id,
+                    message_id=message.id,
+                )
+            except ChatForwardsRestricted:
+                logger.info(f"Source forward-restricted — file_id fallback for target {target}")
+                return await _send_restricted_media(
+                    client, message, target,
+                    caption=new_text if has_text else None,
+                    parse_mode=parse_mode,
+                )
 
         caption  = new_text if has_text else None
         cap_mode = parse_mode if caption else enums.ParseMode.DISABLED
@@ -614,10 +632,25 @@ async def _forward_one(
             return await client.send_voice(target, message.voice.file_id,
                                            caption=caption, parse_mode=cap_mode)
         else:
-            return await client.copy_message(target, message.chat.id, message.id)
+            try:
+                return await client.copy_message(target, message.chat.id, message.id)
+            except ChatForwardsRestricted:
+                return await _send_restricted_media(
+                    client, message, target,
+                    caption=new_text if has_text else None,
+                    parse_mode=parse_mode,
+                )
 
     except PeerIdInvalid:
         logger.error(f"❌ Peer invalid: {target} — Userbot ne channel join nahi kiya.")
+    except ChatForwardsRestricted:
+        # Outer safety net
+        logger.info(f"Source forward-restricted (outer catch) — file_id fallback for target {target}")
+        return await _send_restricted_media(
+            client, message, target,
+            caption=new_text if has_text else None,
+            parse_mode=parse_mode,
+        )
     except FloodWait as e:
         logger.warning(f"FloodWait {e.value}s for target {target}")
         await asyncio.sleep(e.value + 1)
@@ -629,6 +662,75 @@ async def _forward_one(
     except Exception as e:
         logger.error(f"Forward to {target} failed: {e}")
     return None
+
+
+async def _send_restricted_media(
+    client: Client,
+    message: Message,
+    target: int,
+    caption: str | None = None,
+    parse_mode=enums.ParseMode.DISABLED,
+) -> "Message | None":
+    """
+    Forward-restricted source ke liye fallback:
+    file_id se direct send karta hai (no copy/forward).
+    Agar file_id bhi kaam na kare to download karke re-upload.
+    """
+    cap_mode = parse_mode if caption else enums.ParseMode.DISABLED
+    try:
+        if message.photo:
+            return await client.send_photo(target, message.photo.file_id,
+                                           caption=caption, parse_mode=cap_mode)
+        elif message.video:
+            return await client.send_video(target, message.video.file_id,
+                                           caption=caption, parse_mode=cap_mode,
+                                           supports_streaming=True)
+        elif message.audio:
+            return await client.send_audio(target, message.audio.file_id,
+                                           caption=caption, parse_mode=cap_mode)
+        elif message.document:
+            return await client.send_document(target, message.document.file_id,
+                                              caption=caption, parse_mode=cap_mode)
+        elif message.animation:
+            return await client.send_animation(target, message.animation.file_id,
+                                               caption=caption, parse_mode=cap_mode)
+        elif message.voice:
+            return await client.send_voice(target, message.voice.file_id,
+                                           caption=caption, parse_mode=cap_mode)
+        elif message.video_note:
+            return await client.send_video_note(target, message.video_note.file_id)
+        elif message.sticker:
+            return await client.send_sticker(target, message.sticker.file_id)
+        elif message.text or caption:
+            return await client.send_message(target, caption or message.text,
+                                             parse_mode=cap_mode)
+        else:
+            logger.warning(f"_send_restricted_media: unknown media type for msg {message.id}")
+            return None
+    except Exception as e:
+        logger.error(f"_send_restricted_media file_id failed ({e}), trying download re-upload")
+        try:
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmpdir:
+                dl_path = await client.download_media(message, file_name=tmpdir + "/")
+                if not dl_path:
+                    return None
+                if message.photo:
+                    return await client.send_photo(target, dl_path,
+                                                   caption=caption, parse_mode=cap_mode)
+                elif message.video:
+                    return await client.send_video(target, dl_path,
+                                                   caption=caption, parse_mode=cap_mode,
+                                                   supports_streaming=True)
+                elif message.audio:
+                    return await client.send_audio(target, dl_path,
+                                                   caption=caption, parse_mode=cap_mode)
+                else:
+                    return await client.send_document(target, dl_path,
+                                                      caption=caption, parse_mode=cap_mode)
+        except Exception as e2:
+            logger.error(f"_send_restricted_media download fallback also failed: {e2}")
+            return None
 
 
 def _has_media(message: Message) -> bool:
