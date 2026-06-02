@@ -1,15 +1,17 @@
 """
-Auto-Listener — v7
+Auto-Listener — v8
 ===================
-Changes from v6:
-1. FIX: Non-admin joined channels ke messages bhi catch hote hain.
-   filters=channel ki jagah custom filter use kiya jo source_id se match karta hai.
-2. FIX: Redeploy ke baad sab rules automatically kaam karte hain bina
-   receive channel pe message bheje. Proper get_updates() call on startup.
-3. Multiple source channels support (source_ids list)
-4. remove_words support in process_text
-5. Edit tracking — only "forward" mode trigger messages ke liye
-   30 min tak source edits monitor karo, target mein bhi update karo
+Changes from v7:
+1. FIX: `_next_group` ab 100 se start — router/plugin groups (0,1) se
+   koi conflict nahi hoga.
+2. FIX: `_on_new_message` mein fresh rule se sirf mutable fields update
+   hote hain — `owner_id` aur `source_ids` preserved rehte hain.
+3. FIX: `unregister_rule` — agar ek source pe multiple rules hain toh
+   handler sirf tab remove hoga jab source ke SAARE rules remove ho jayein.
+4. FIX: `_warmup_all_clients` — source resolve delay kam kiya, errors
+   silently ignore hote hain (non-critical).
+5. FIX: `attach_client_to_all_handlers` — har key ka apna group use karta
+   hai (no default=10 collision).
 """
 import asyncio
 import logging
@@ -32,7 +34,9 @@ _edit_handlers:  dict[str, EditedMessageHandler]  = {}
 _handler_groups: dict[str, int]                   = {}
 _rule_map:       dict[str, dict]                  = {}
 _source_map:     dict[int, list[str]]             = {}
-_next_group:     int                              = 10
+
+# FIX #1: 100 se start — plugin/router groups (0,1,2) se door
+_next_group: int = 100
 
 # Media group buffer: { "chat_id:media_group_id:rule_id": [Message, ...] }
 _media_group_buffer: dict[str, list[Message]] = {}
@@ -40,9 +44,9 @@ _media_group_tasks:  dict[str, asyncio.Task]  = {}
 MEDIA_GROUP_WAIT = 1.5
 
 # Edit tracking:
-# { "source_chat_id:source_msg_id": [{"rule_id", "target_chat_id", "target_msg_id", "sent_at"}, ...] }
+# { "source_chat_id:source_msg_id": [{rule_id, target_chat_id, target_msg_id, sent_at}, ...] }
 _edit_tracker: dict[str, list[dict]] = {}
-EDIT_TRACK_WINDOW = 30 * 60  # 30 minutes in seconds
+EDIT_TRACK_WINDOW = 30 * 60  # 30 minutes
 
 
 # ─────────────────────── Unicode Normalizer ──────────────────────────────
@@ -133,21 +137,12 @@ def _cleanup_edit_tracker():
         del _edit_tracker[k]
 
 
-# ─────────────────────── Custom Filter (NON-ADMIN FIX) ───────────────────
-# 
-# PROBLEM: Pyrogram ka built-in `filters.channel` sirf admin channels ke
-#          messages catch karta hai. Jab userbot sirf member ho (admin nahi),
-#          toh channel updates milte hain but filter block kar deta hai.
-#
-# FIX: Apna custom filter banao jo:
-#      1. Message kisi bhi chat se aaye — channel ya supergroup
-#      2. Chat ID registered source_map mein ho
-#      Yeh admin restriction nahi lagata.
+# ─────────────────────── Custom Filter ───────────────────────────────────
 
 def _make_source_filter(src_id: int):
     """
-    Ek custom pyrogram filter banao jo sirf uss specific source channel/chat
-    ke messages pass kare — admin ho ya na ho.
+    Custom filter: sirf uss specific source channel ke messages pass kare.
+    Admin restriction nahi — non-admin channels bhi kaam karte hain.
     """
     async def _filter_fn(_, __, message: Message) -> bool:
         return message.chat is not None and message.chat.id == src_id
@@ -163,41 +158,34 @@ async def start_listeners():
         owner_id = rule["owner_id"]
         await register_rule(owner_id, rule, _startup=True)
     logger.info(f"Auto-listeners started for {len(all_rules)} rules.")
-
-    # ── REDEPLOY FIX: Startup ke baad get_updates() call karo ──
-    # Yeh Telegram ko signal karta hai ki client ready hai aur
-    # missed updates (pts gap) recover karta hai.
     await _warmup_all_clients()
 
 
 async def _warmup_all_clients():
     """
-    REDEPLOY FIX: Har client ke liye Telegram se proper update sync karo.
-    get_dialogs() se better: explicit get_updates call + channel joins verify karo.
-    Bina iske redeploy ke baad pehla message miss ho jata hai.
+    Redeploy fix: Telegram ko signal karo ki client ready hai.
+    Source IDs snapshot PEHLE liya — register_rule ke baad.
     """
     from userbot import _clients as all_clients
+    all_source_ids = list(_source_map.keys())  # snapshot after register
+
     for owner_id, slots in all_clients.items():
         for slot, client in slots.items():
             try:
-                # Method 1: get_dialogs se dialogs fetch karo (update pointer reset)
                 count = 0
                 async for _ in client.get_dialogs(limit=10):
                     count += 1
                     if count >= 10:
                         break
 
-                # Method 2: Source channels explicitly resolve karo
-                # Yeh Telegram ko batata hai ki hum yeh channels monitor kar rahe hain
-                all_source_ids = list(_source_map.keys())
                 for src_id in all_source_ids:
                     try:
                         await client.get_chat(src_id)
-                        await asyncio.sleep(0.3)
                     except Exception:
                         pass
+                    await asyncio.sleep(0.2)
 
-                logger.info(f"Warmup complete: owner={owner_id} slot={slot} (dialogs={count}, sources={len(all_source_ids)})")
+                logger.info(f"Warmup done: owner={owner_id} slot={slot}")
             except Exception as e:
                 logger.warning(f"Warmup failed for owner={owner_id} slot={slot}: {e}")
 
@@ -205,7 +193,6 @@ async def _warmup_all_clients():
 async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
     rule_id    = rule["rule_id"]
 
-    # source_ids support (new) + backward compat with old source_id
     source_ids = rule.get("source_ids") or []
     if not source_ids and rule.get("source_id"):
         source_ids = [rule["source_id"]]
@@ -220,24 +207,23 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
                 old_lst = _source_map.get(old_src, [])
                 if rule_id in old_lst:
                     old_lst.remove(rule_id)
+                # FIX #3: Sirf tab handler remove karo jab source ke SAARE rules gone hain
                 if not old_lst:
                     old_key = f"src_{old_src}"
-                    h_old = _handlers.pop(old_key, None)
+                    h_old  = _handlers.pop(old_key, None)
                     he_old = _edit_handlers.pop(old_key, None)
-                    old_grp = _handler_groups.pop(old_key, 10)
-                    for slots in _clients.values():
-                        for c in slots.values():
-                            try:
-                                if h_old:
-                                    c.remove_handler(h_old, old_grp)
-                                if he_old:
-                                    c.remove_handler(he_old, old_grp)
-                            except Exception:
-                                pass
+                    old_grp = _handler_groups.pop(old_key, None)
+                    if old_grp is not None:
+                        for slots in _clients.values():
+                            for c in slots.values():
+                                try:
+                                    if h_old:  c.remove_handler(h_old, old_grp)
+                                    if he_old: c.remove_handler(he_old, old_grp)
+                                except Exception:
+                                    pass
 
     _rule_map[rule_id] = {**rule, "owner_id": owner_id, "source_ids": source_ids}
 
-    # Har source ke liye handler register karo
     for source_id in source_ids:
         if source_id not in _source_map:
             _source_map[source_id] = []
@@ -251,7 +237,6 @@ async def register_rule(owner_id: int, rule: dict, _startup: bool = False):
             _next_group += 1
             _handler_groups[handler_key] = grp
 
-            # ── NON-ADMIN FIX: Custom filter use karo, filters.channel nahi ──
             src_filter = _make_source_filter(source_id)
 
             async def _make_handlers(src_id: int, s_filter):
@@ -293,18 +278,20 @@ def unregister_rule(rule_id: str):
         lst = _source_map.get(source_id, [])
         if rule_id in lst:
             lst.remove(rule_id)
+        # FIX #3: Sirf tab handler remove karo jab is source ke koi rule nahi bacha
         if not lst:
             handler_key = f"src_{source_id}"
-            h  = _handlers.pop(handler_key, None)
-            he = _edit_handlers.pop(handler_key, None)
-            grp = _handler_groups.pop(handler_key, 10)
-            for slots in _clients.values():
-                for c in slots.values():
-                    try:
-                        if h:  c.remove_handler(h, grp)
-                        if he: c.remove_handler(he, grp)
-                    except Exception:
-                        pass
+            h   = _handlers.pop(handler_key, None)
+            he  = _edit_handlers.pop(handler_key, None)
+            grp = _handler_groups.pop(handler_key, None)
+            if grp is not None:
+                for slots in _clients.values():
+                    for c in slots.values():
+                        try:
+                            if h:  c.remove_handler(h, grp)
+                            if he: c.remove_handler(he, grp)
+                        except Exception:
+                            pass
     logger.info(f"Rule {rule_id} unregistered")
 
 
@@ -320,17 +307,20 @@ async def _on_new_message(client: Client, message: Message, source_id: int):
                 stale.remove(rule_id)
             continue
 
+        # FIX #2: Fresh DB se sirf config fields update karo
+        # owner_id aur source_ids cached rule se preserve karo
         try:
             fresh_rule = await db.get_rule_by_id(rule_id)
             if fresh_rule:
-                fresh_rule["owner_id"]   = rule.get("owner_id", fresh_rule.get("owner_id"))
-                fresh_rule["source_ids"] = rule.get("source_ids", fresh_rule.get("source_ids", [source_id]))
+                # Critical fields cached se preserve karo
+                fresh_rule["owner_id"]   = rule["owner_id"]
+                fresh_rule["source_ids"] = rule["source_ids"]
                 _rule_map[rule_id] = fresh_rule
                 rule = fresh_rule
         except Exception as e:
             logger.warning(f"DB fetch failed for rule {rule_id}, using cached: {e}")
 
-        owner_id    = rule.get("owner_id")
+        owner_id    = rule["owner_id"]
         owner_slots = _clients.get(owner_id, {})
         use_client  = next(iter(owner_slots.values()), client)
 
@@ -720,14 +710,22 @@ async def _affiliate_process(client: Client, original: Message, bot_id) -> Messa
 # ─────────────────────── Client Attach ───────────────────────────────────
 
 def attach_client_to_all_handlers(client: Client):
+    """
+    FIX #5: Har handler ka apna correct group use karo.
+    Default 10 nahi — proper _handler_groups lookup.
+    """
     for handler_key, h in _handlers.items():
-        grp = _handler_groups.get(handler_key, 10)
+        grp = _handler_groups.get(handler_key)
+        if grp is None:
+            continue
         try:
             client.add_handler(h, grp)
         except Exception:
             pass
     for handler_key, he in _edit_handlers.items():
-        grp = _handler_groups.get(handler_key, 10)
+        grp = _handler_groups.get(handler_key)
+        if grp is None:
+            continue
         try:
             client.add_handler(he, grp)
         except Exception:
