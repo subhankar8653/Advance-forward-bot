@@ -574,44 +574,20 @@ async def _forward_one(
 ) -> Message | None:
     has_text   = bool(new_text and new_text.strip())
     parse_mode = enums.ParseMode.HTML if bold_text else enums.ParseMode.DISABLED
-
-    # Inline keyboard buttons preserve karo (URL buttons, etc.)
     reply_markup = message.reply_markup if message.reply_markup else None
 
     try:
+        # Special case: remove_thumbnail — sirf text bhejo
         if remove_thumbnail:
             if has_text:
                 return await client.send_message(target, new_text, parse_mode=parse_mode,
                                                  reply_markup=reply_markup)
             return None
 
-        if not _has_media(message):
-            if not needs_processing:
-                # Pehle copy_message try karo — entities + buttons sab preserve honge
-                try:
-                    return await client.copy_message(
-                        chat_id=target,
-                        from_chat_id=message.chat.id,
-                        message_id=message.id,
-                    )
-                except ChatForwardsRestricted:
-                    pass
-                except Exception:
-                    pass
-            # copy_message fail ya processing needed — entities preserve karke send karo
-            if has_text:
-                # Original entities use karo agar processing nahi hai
-                if not needs_processing and message.entities:
-                    return await client.send_message(
-                        target, message.text,
-                        entities=message.entities,
-                        reply_markup=reply_markup,
-                    )
-                return await client.send_message(target, new_text, parse_mode=parse_mode,
-                                                 reply_markup=reply_markup)
-            return None
-
-        if not needs_processing:
+        # ── STEP 1: Hamesha copy_message try karo ──
+        # Yeh sabse best method hai — bold, links, quotes, buttons — sab exactly copy hota hai
+        # needs_processing ho ya na ho, copy_message pehle try karo
+        if not needs_processing or message.reply_markup:
             try:
                 return await client.copy_message(
                     chat_id=target,
@@ -619,51 +595,72 @@ async def _forward_one(
                     message_id=message.id,
                 )
             except ChatForwardsRestricted:
-                logger.info(f"Source forward-restricted — file_id fallback for target {target}")
-                return await _send_restricted_media(
-                    client, message, target,
-                    caption=new_text if has_text else None,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup,
-                )
+                logger.info(f"Source forward-restricted — manual fallback for target {target}")
+            except Exception as e:
+                logger.warning(f"copy_message failed ({e}) — manual fallback for target {target}")
 
+        # ── STEP 2: copy_message fail hua — manual send with entities ──
+        # Text-only message
+        if not _has_media(message):
+            if has_text:
+                if not needs_processing and (message.entities or reply_markup):
+                    # Entities + buttons dono preserve karo
+                    return await client.send_message(
+                        target, message.text or new_text,
+                        entities=message.entities or None,
+                        reply_markup=reply_markup,
+                    )
+                return await client.send_message(target, new_text, parse_mode=parse_mode,
+                                                 reply_markup=reply_markup)
+            return None
+
+        # Media message — needs_processing ke saath manual send
         caption  = new_text if has_text else None
         cap_mode = parse_mode if caption else enums.ParseMode.DISABLED
+        # Agar no processing — original caption entities use karo
+        cap_entities = None
+        if not needs_processing and (message.caption_entities or message.entities):
+            cap_entities = message.caption_entities or message.entities
+            caption = message.caption or message.text or caption
+            cap_mode = enums.ParseMode.DISABLED
 
         if message.photo:
             return await client.send_photo(target, message.photo.file_id,
                                            caption=caption, parse_mode=cap_mode,
+                                           caption_entities=cap_entities,
                                            reply_markup=reply_markup)
         elif message.video:
             return await client.send_video(target, message.video.file_id,
                                            caption=caption, parse_mode=cap_mode,
+                                           caption_entities=cap_entities,
                                            supports_streaming=True, reply_markup=reply_markup)
         elif message.audio:
             return await client.send_audio(target, message.audio.file_id,
                                            caption=caption, parse_mode=cap_mode,
+                                           caption_entities=cap_entities,
                                            reply_markup=reply_markup)
         elif message.document:
             return await client.send_document(target, message.document.file_id,
                                               caption=caption, parse_mode=cap_mode,
+                                              caption_entities=cap_entities,
                                               reply_markup=reply_markup)
         elif message.animation:
             return await client.send_animation(target, message.animation.file_id,
                                                caption=caption, parse_mode=cap_mode,
+                                               caption_entities=cap_entities,
                                                reply_markup=reply_markup)
         elif message.voice:
             return await client.send_voice(target, message.voice.file_id,
                                            caption=caption, parse_mode=cap_mode,
+                                           caption_entities=cap_entities,
                                            reply_markup=reply_markup)
         else:
-            try:
-                return await client.copy_message(target, message.chat.id, message.id)
-            except ChatForwardsRestricted:
-                return await _send_restricted_media(
-                    client, message, target,
-                    caption=new_text if has_text else None,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup,
-                )
+            return await _send_restricted_media(
+                client, message, target,
+                caption=caption,
+                parse_mode=cap_mode,
+                reply_markup=reply_markup,
+            )
 
     except PeerIdInvalid:
         logger.error(f"❌ Peer invalid: {target} — Userbot ne channel join nahi kiya.")
