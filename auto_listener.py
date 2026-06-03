@@ -586,7 +586,27 @@ async def _forward_one(
             return None
 
         if not _has_media(message):
+            if not needs_processing:
+                # Pehle copy_message try karo — entities + buttons sab preserve honge
+                try:
+                    return await client.copy_message(
+                        chat_id=target,
+                        from_chat_id=message.chat.id,
+                        message_id=message.id,
+                    )
+                except ChatForwardsRestricted:
+                    pass
+                except Exception:
+                    pass
+            # copy_message fail ya processing needed — entities preserve karke send karo
             if has_text:
+                # Original entities use karo agar processing nahi hai
+                if not needs_processing and message.entities:
+                    return await client.send_message(
+                        target, message.text,
+                        entities=message.entities,
+                        reply_markup=reply_markup,
+                    )
                 return await client.send_message(target, new_text, parse_mode=parse_mode,
                                                  reply_markup=reply_markup)
             return None
@@ -714,6 +734,13 @@ async def _send_restricted_media(
         elif message.sticker:
             return await client.send_sticker(target, message.sticker.file_id)
         elif message.text or caption:
+            # Agar caption override nahi hai aur original entities hain toh preserve karo
+            if caption is None and message.entities:
+                return await client.send_message(
+                    target, message.text,
+                    entities=message.entities,
+                    reply_markup=reply_markup,
+                )
             return await client.send_message(target, caption or message.text,
                                              parse_mode=cap_mode, reply_markup=reply_markup)
         else:
