@@ -490,8 +490,8 @@ async def _flush_media_group(client: Client, buf_key: str, rule: dict):
 
 # ─────────────────────── Core Processing (single message) ────────────────
 
-def _needs_processing(rule: dict) -> bool:
-    return bool(
+def _needs_processing(rule: dict, message=None) -> bool:
+    rule_proc = bool(
         rule.get("bold_text") or
         rule.get("hide_links") or
         rule.get("hide_usernames") or
@@ -499,6 +499,9 @@ def _needs_processing(rule: dict) -> bool:
         rule.get("remove_thumbnail") or
         rule.get("remove_words")
     )
+    # Agar message mein inline buttons hain toh bhi manually send karo taaki reply_markup preserve ho
+    has_markup = bool(message and message.reply_markup)
+    return rule_proc or has_markup
 
 
 async def _process_and_forward(client: Client, message: Message, rule: dict):
@@ -545,7 +548,7 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
             new_text=new_text,
             remove_thumbnail=remove_thumbnail,
             bold_text=bold_text,
-            needs_processing=_needs_processing(rule),
+            needs_processing=_needs_processing(rule, message),
         )
         if sent_msg and is_only_forward_mode and rule_id:
             _register_edit_track(
@@ -572,15 +575,20 @@ async def _forward_one(
     has_text   = bool(new_text and new_text.strip())
     parse_mode = enums.ParseMode.HTML if bold_text else enums.ParseMode.DISABLED
 
+    # Inline keyboard buttons preserve karo (URL buttons, etc.)
+    reply_markup = message.reply_markup if message.reply_markup else None
+
     try:
         if remove_thumbnail:
             if has_text:
-                return await client.send_message(target, new_text, parse_mode=parse_mode)
+                return await client.send_message(target, new_text, parse_mode=parse_mode,
+                                                 reply_markup=reply_markup)
             return None
 
         if not _has_media(message):
             if has_text:
-                return await client.send_message(target, new_text, parse_mode=parse_mode)
+                return await client.send_message(target, new_text, parse_mode=parse_mode,
+                                                 reply_markup=reply_markup)
             return None
 
         if not needs_processing:
@@ -596,6 +604,7 @@ async def _forward_one(
                     client, message, target,
                     caption=new_text if has_text else None,
                     parse_mode=parse_mode,
+                    reply_markup=reply_markup,
                 )
 
         caption  = new_text if has_text else None
@@ -603,23 +612,28 @@ async def _forward_one(
 
         if message.photo:
             return await client.send_photo(target, message.photo.file_id,
-                                           caption=caption, parse_mode=cap_mode)
+                                           caption=caption, parse_mode=cap_mode,
+                                           reply_markup=reply_markup)
         elif message.video:
             return await client.send_video(target, message.video.file_id,
                                            caption=caption, parse_mode=cap_mode,
-                                           supports_streaming=True)
+                                           supports_streaming=True, reply_markup=reply_markup)
         elif message.audio:
             return await client.send_audio(target, message.audio.file_id,
-                                           caption=caption, parse_mode=cap_mode)
+                                           caption=caption, parse_mode=cap_mode,
+                                           reply_markup=reply_markup)
         elif message.document:
             return await client.send_document(target, message.document.file_id,
-                                              caption=caption, parse_mode=cap_mode)
+                                              caption=caption, parse_mode=cap_mode,
+                                              reply_markup=reply_markup)
         elif message.animation:
             return await client.send_animation(target, message.animation.file_id,
-                                               caption=caption, parse_mode=cap_mode)
+                                               caption=caption, parse_mode=cap_mode,
+                                               reply_markup=reply_markup)
         elif message.voice:
             return await client.send_voice(target, message.voice.file_id,
-                                           caption=caption, parse_mode=cap_mode)
+                                           caption=caption, parse_mode=cap_mode,
+                                           reply_markup=reply_markup)
         else:
             try:
                 return await client.copy_message(target, message.chat.id, message.id)
@@ -628,6 +642,7 @@ async def _forward_one(
                     client, message, target,
                     caption=new_text if has_text else None,
                     parse_mode=parse_mode,
+                    reply_markup=reply_markup,
                 )
 
     except PeerIdInvalid:
@@ -639,6 +654,7 @@ async def _forward_one(
             client, message, target,
             caption=new_text if has_text else None,
             parse_mode=parse_mode,
+            reply_markup=reply_markup,
         )
     except FloodWait as e:
         logger.warning(f"FloodWait {e.value}s for target {target}")
@@ -659,40 +675,47 @@ async def _send_restricted_media(
     target: int,
     caption: str | None = None,
     parse_mode=enums.ParseMode.DISABLED,
+    reply_markup=None,
 ) -> "Message | None":
     """
     Forward-restricted source ke liye fallback:
     file_id se direct send karta hai (no copy/forward).
     Agar file_id bhi kaam na kare to download karke re-upload.
+    reply_markup: inline buttons bhi forward honge.
     """
     cap_mode = parse_mode if caption else enums.ParseMode.DISABLED
     try:
         if message.photo:
             return await client.send_photo(target, message.photo.file_id,
-                                           caption=caption, parse_mode=cap_mode)
+                                           caption=caption, parse_mode=cap_mode,
+                                           reply_markup=reply_markup)
         elif message.video:
             return await client.send_video(target, message.video.file_id,
                                            caption=caption, parse_mode=cap_mode,
-                                           supports_streaming=True)
+                                           supports_streaming=True, reply_markup=reply_markup)
         elif message.audio:
             return await client.send_audio(target, message.audio.file_id,
-                                           caption=caption, parse_mode=cap_mode)
+                                           caption=caption, parse_mode=cap_mode,
+                                           reply_markup=reply_markup)
         elif message.document:
             return await client.send_document(target, message.document.file_id,
-                                              caption=caption, parse_mode=cap_mode)
+                                              caption=caption, parse_mode=cap_mode,
+                                              reply_markup=reply_markup)
         elif message.animation:
             return await client.send_animation(target, message.animation.file_id,
-                                               caption=caption, parse_mode=cap_mode)
+                                               caption=caption, parse_mode=cap_mode,
+                                               reply_markup=reply_markup)
         elif message.voice:
             return await client.send_voice(target, message.voice.file_id,
-                                           caption=caption, parse_mode=cap_mode)
+                                           caption=caption, parse_mode=cap_mode,
+                                           reply_markup=reply_markup)
         elif message.video_note:
             return await client.send_video_note(target, message.video_note.file_id)
         elif message.sticker:
             return await client.send_sticker(target, message.sticker.file_id)
         elif message.text or caption:
             return await client.send_message(target, caption or message.text,
-                                             parse_mode=cap_mode)
+                                             parse_mode=cap_mode, reply_markup=reply_markup)
         else:
             logger.warning(f"_send_restricted_media: unknown media type for msg {message.id}")
             return None
