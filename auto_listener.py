@@ -541,7 +541,7 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
 
     rule_id = rule.get("rule_id", "")
     is_only_forward_mode = rule.get("specific_forward_mode") == "forward"
-    keep_buttons = rule.get("keep_buttons", True)
+    keep_buttons = rule.get("keep_buttons", False)
 
     for target in targets:
         sent_msg = await _forward_one(
@@ -573,7 +573,7 @@ async def _forward_one(
     remove_thumbnail: bool = False,
     bold_text: bool = False,
     needs_processing: bool = False,
-    keep_buttons: bool = True,
+    keep_buttons: bool = False,
 ) -> Message | None:
     has_text   = bool(new_text and new_text.strip())
     parse_mode = enums.ParseMode.HTML if bold_text else enums.ParseMode.DISABLED
