@@ -235,6 +235,7 @@ async def handle_auto_step(bot: Client, msg: Message):
                 InlineKeyboardButton("🚫 Specific NOT Forward: OFF", callback_data=f"sfwd#{owner_id}#not_forward"),
             ],
             [InlineKeyboardButton("⏭ Skip → Step 7/8", callback_data=f"sfwd#{owner_id}#skip")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"acancel#{owner_id}")],
         ])
         await msg.reply(
             "**Step 6/8** — Specific message forward setting:\n\n"
@@ -254,6 +255,7 @@ async def handle_auto_step(bot: Client, msg: Message):
                 InlineKeyboardButton("🚫 Specific NOT Forward: OFF", callback_data=f"sfwd#{owner_id}#not_forward"),
             ],
             [InlineKeyboardButton("⏭ Skip → Step 7/8", callback_data=f"sfwd#{owner_id}#skip")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"acancel#{owner_id}")],
         ])
         return await msg.reply(
             "⚠️ Text nahi — **button tap karo:**\n\n"
@@ -317,7 +319,20 @@ def _hide_settings_keyboard(owner_id: int, state: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"𝐁 Text Bold: {bt}", callback_data=f"aflag#{owner_id}#bold_text"),
         ],
         [InlineKeyboardButton("✅ Done → Step 5/8", callback_data=f"aflag#{owner_id}#done")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"acancel#{owner_id}")],
     ])
+
+
+@Client.on_callback_query(filters.regex(r"^acancel#"))
+async def cb_acancel(bot: Client, query: CallbackQuery):
+    _, owner_id_str = query.data.split("#")
+    owner_id = int(owner_id_str)
+    if query.from_user.id != owner_id:
+        return await query.answer("Yeh tumhara nahi.", show_alert=True)
+    AUTO_STATE.pop(owner_id, None)
+    clear_all(owner_id)
+    await query.message.edit_text("❌ Cancelled. /auto se dobara shuru karo.")
+    await query.answer()
 
 
 @Client.on_callback_query(filters.regex(r"^aflag#"))
@@ -455,14 +470,7 @@ async def _save_rule(msg: Message, owner_id: int, state: dict):
 
 # ───────────────────────── /rules ─────────────────────────────────────────────
 
-@Client.on_message(filters.private & filters.command("rules"))
-async def cmd_rules(bot: Client, msg: Message):
-    owner_id = msg.from_user.id
-    rules    = await db.get_auto_rules(owner_id)
-    if not rules:
-        return await msg.reply("📭 Koi auto-forward rule nahi hai.\nBanao: /auto")
-
-    client  = await get_client(owner_id)
+def _render_rules_list(owner_id: int, rules: list) -> tuple[str, InlineKeyboardMarkup]:
     lines   = []
     buttons = []
     for r in rules:
@@ -480,10 +488,19 @@ async def cmd_rules(bot: Client, msg: Message):
             InlineKeyboardButton(f"🗑 Delete {rid}", callback_data=f"del_rule#{owner_id}#{rid}")
         ])
 
-    await msg.reply(
-        "📋 **Auto-Forward Rules:**\n\n" + "\n\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
-    )
+    text = "📋 **Auto-Forward Rules:**\n\n" + "\n\n".join(lines)
+    return text, InlineKeyboardMarkup(buttons)
+
+
+@Client.on_message(filters.private & filters.command("rules"))
+async def cmd_rules(bot: Client, msg: Message):
+    owner_id = msg.from_user.id
+    rules    = await db.get_auto_rules(owner_id)
+    if not rules:
+        return await msg.reply("📭 Koi auto-forward rule nahi hai.\nBanao: /auto")
+
+    text, markup = _render_rules_list(owner_id, rules)
+    await msg.reply(text, reply_markup=markup)
 
 
 @Client.on_callback_query(filters.regex(r"^del_rule#"))
@@ -501,24 +518,10 @@ async def cb_del_rule(bot: Client, query: CallbackQuery):
         await query.message.edit_text(f"✅ Rule `{rule_id}` delete ho gaya.\n\n📭 Ab koi rule nahi hai. Banao: /auto")
         return
 
-    lines   = []
-    buttons = []
-    for r in rules:
-        rid        = r["rule_id"]
-        source_ids = r.get("source_ids") or ([r["source_id"]] if r.get("source_id") else [])
-        lines.append(
-            f"🔹 `{rid}` — {len(source_ids)} source(s) → {len(r['targets'])} target(s)\n"
-            f"   Links: {r.get('hide_links',False)} | @hide: {r.get('hide_usernames',False)} | "
-            f"Thumb: {r.get('remove_thumbnail',False)} | Bold: {r.get('bold_text',False)}"
-        )
-        buttons.append([
-            InlineKeyboardButton(f"✏️ Edit {rid}", callback_data=f"edit_rule#{owner_id}#{rid}"),
-            InlineKeyboardButton(f"🗑 Delete {rid}", callback_data=f"del_rule#{owner_id}#{rid}")
-        ])
-
+    text, markup = _render_rules_list(owner_id, rules)
     await query.message.edit_text(
-        f"✅ Rule `{rule_id}` delete ho gaya.\n\n📋 **Baaki Rules:**\n\n" + "\n\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(buttons)
+        f"✅ Rule `{rule_id}` delete ho gaya.\n\n" + text,
+        reply_markup=markup
     )
 
 
@@ -556,27 +559,19 @@ def _edit_rule_keyboard(owner_id: int, rule_id: str, rule: dict) -> InlineKeyboa
         [InlineKeyboardButton(f"🗑 Remove Words ({rw_count})", callback_data=f"redit#{owner_id}#{rule_id}#remove_words")],
         [InlineKeyboardButton(f"📌 Forward Mode: {mode_label}", callback_data=f"redit#{owner_id}#{rule_id}#specific_forward_mode")],
         [InlineKeyboardButton("⚡ Trigger Words",    callback_data=f"redit#{owner_id}#{rule_id}#triggers")],
-        [InlineKeyboardButton("❌ Close",            callback_data=f"redit#{owner_id}#{rule_id}#close")],
+        [
+            InlineKeyboardButton("🔙 Back",  callback_data=f"redit#{owner_id}#{rule_id}#back_to_list"),
+            InlineKeyboardButton("❌ Close", callback_data=f"redit#{owner_id}#{rule_id}#close"),
+        ],
     ])
 
 
-@Client.on_callback_query(filters.regex(r"^edit_rule#"))
-async def cb_edit_rule(bot: Client, query: CallbackQuery):
-    _, owner_id_str, rule_id = query.data.split("#")
-    owner_id = int(owner_id_str)
-    if query.from_user.id != owner_id:
-        return await query.answer("Yeh tumhara nahi.", show_alert=True)
-
-    rule = await db.get_rule_by_id(rule_id)
-    if not rule:
-        return await query.message.edit_text("❌ Rule nahi mila.")
-
+async def _render_edit_rule_view(owner_id: int, rule_id: str, rule: dict) -> tuple[str, InlineKeyboardMarkup]:
     client = await get_client(owner_id)
 
     source_ids = rule.get("source_ids") or ([rule["source_id"]] if rule.get("source_id") else [])
     target_ids = rule.get("targets", [])
 
-    await query.answer("⏳ Details load ho rahi hain...")
     source_labels = await _resolve_chat_labels(client, source_ids)
     target_labels = await _resolve_chat_labels(client, target_ids)
     sources_str = "\n".join(f"    {i+1}. {lbl}" for i, lbl in enumerate(source_labels)) or "    None"
@@ -594,8 +589,7 @@ async def cb_edit_rule(bot: Client, query: CallbackQuery):
     tw = rule.get("trigger_words", [])
     tw_str = ", ".join(f"`{w}`" for w in tw) if tw else "None"
 
-    buttons = _edit_rule_keyboard(owner_id, rule_id, rule)
-    await query.message.edit_text(
+    text = (
         f"✏️ **Edit Rule** `{rule_id}`\n\n"
         f"📥 **Sources** ({len(source_ids)}):\n{sources_str}\n\n"
         f"📤 **Targets** ({len(target_ids)}):\n{targets_str}\n\n"
@@ -609,9 +603,25 @@ async def cb_edit_rule(bot: Client, query: CallbackQuery):
         f"🗑 **Remove words** ({len(rw)}): {rw_str}\n\n"
         f"📌 Forward mode: {mode_label}\n"
         f"⚡ **Trigger words** ({len(tw)}): {tw_str}\n\n"
-        "Kya change karna hai?",
-        reply_markup=buttons
+        "Kya change karna hai?"
     )
+    return text, _edit_rule_keyboard(owner_id, rule_id, rule)
+
+
+@Client.on_callback_query(filters.regex(r"^edit_rule#"))
+async def cb_edit_rule(bot: Client, query: CallbackQuery):
+    _, owner_id_str, rule_id = query.data.split("#")
+    owner_id = int(owner_id_str)
+    if query.from_user.id != owner_id:
+        return await query.answer("Yeh tumhara nahi.", show_alert=True)
+
+    rule = await db.get_rule_by_id(rule_id)
+    if not rule:
+        return await query.message.edit_text("❌ Rule nahi mila.")
+
+    await query.answer("⏳ Details load ho rahi hain...")
+    text, markup = await _render_edit_rule_view(owner_id, rule_id, rule)
+    await query.message.edit_text(text, reply_markup=markup)
 
 
 @Client.on_callback_query(filters.regex(r"^redit#"))
@@ -628,6 +638,20 @@ async def cb_redit(bot: Client, query: CallbackQuery):
 
     if field == "close":
         return await query.message.edit_text("✅ Edit band kar diya.")
+
+    if field == "back_to_list":
+        rules = await db.get_auto_rules(owner_id)
+        if not rules:
+            return await query.message.edit_text("📭 Ab koi rule nahi hai. Banao: /auto")
+        text, markup = _render_rules_list(owner_id, rules)
+        return await query.message.edit_text(text, reply_markup=markup)
+
+    if field == "cancel_input":
+        # Field-edit prompt se wapas Edit Rule menu par
+        clear_all(owner_id)
+        await query.answer("⏳ Details load ho rahi hain...")
+        text, markup = await _render_edit_rule_view(owner_id, rule_id, rule)
+        return await query.message.edit_text(text, reply_markup=markup)
 
     # Toggle boolean fields
     if field in ("hide_links", "hide_usernames", "remove_thumbnail", "bold_text"):
@@ -707,7 +731,13 @@ async def cb_redit(bot: Client, query: CallbackQuery):
             "/cancel — cancel"
         ),
     }
-    await query.message.edit_text(prompts.get(field, "Value bhejo:") + "\n\n/cancel — cancel")
+    back_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back", callback_data=f"redit#{owner_id}#{rule_id}#cancel_input")]
+    ])
+    await query.message.edit_text(
+        prompts.get(field, "Value bhejo:") + "\n\n/cancel — cancel",
+        reply_markup=back_keyboard
+    )
     await query.answer()
 
 
