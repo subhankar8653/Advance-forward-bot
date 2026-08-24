@@ -396,6 +396,7 @@ async def _save_rule(msg: Message, owner_id: int, state: dict):
         "specific_forward_mode": state.get("specific_forward_mode"),
         "trigger_words"        : state.get("trigger_words", []),
         "remove_words"         : state.get("remove_words", []),
+        "keep_buttons"         : state.get("keep_buttons", True),
     }
     await db.add_auto_rule(owner_id, rule)
     from auto_listener import register_rule
@@ -420,7 +421,8 @@ async def _save_rule(msg: Message, owner_id: int, state: dict):
         f"• Bold text: {rule['bold_text']}\n"
         f"• Replacements: {len(rule['replace_map'])}\n"
         f"• Forward mode: {mode_str}\n"
-        f"• Remove words: {remove_words_str}\n\n"
+        f"• Remove words: {remove_words_str}\n"
+        f"• Buttons: {'ON ✅' if rule['keep_buttons'] else 'OFF'}\n\n"
         "Use /rules to manage."
     )
 
@@ -509,6 +511,7 @@ def _edit_rule_keyboard(owner_id: int, rule_id: str, rule: dict) -> InlineKeyboa
         None         : "None",
     }.get(mode, "None")
     rw_count = len(rule.get("remove_words", []))
+    kb       = "ON ✅" if rule.get("keep_buttons", True) else "OFF"
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 Sources Change",   callback_data=f"redit#{owner_id}#{rule_id}#source")],
@@ -522,6 +525,7 @@ def _edit_rule_keyboard(owner_id: int, rule_id: str, rule: dict) -> InlineKeyboa
             InlineKeyboardButton(f"🖼 Thumb: {rt}",  callback_data=f"redit#{owner_id}#{rule_id}#remove_thumbnail"),
             InlineKeyboardButton(f"𝐁 Bold: {bt}",   callback_data=f"redit#{owner_id}#{rule_id}#bold_text"),
         ],
+        [InlineKeyboardButton(f"🔘 Buttons: {kb}",   callback_data=f"redit#{owner_id}#{rule_id}#keep_buttons")],
         [InlineKeyboardButton("🔄 Replace Map",      callback_data=f"redit#{owner_id}#{rule_id}#replace")],
         [InlineKeyboardButton(f"🗑 Remove Words ({rw_count})", callback_data=f"redit#{owner_id}#{rule_id}#remove_words")],
         [InlineKeyboardButton(f"📌 Forward Mode: {mode_label}", callback_data=f"redit#{owner_id}#{rule_id}#specific_forward_mode")],
@@ -566,7 +570,8 @@ async def cb_edit_rule(bot: Client, query: CallbackQuery):
         f"• Replacements: {len(rmap)}" + (f" — {rmap_prev}" if rmap_prev else "") + "\n"
         f"• Remove words: {len(rw)}" + (f" — {rw_prev}" if rw_prev else "") + "\n"
         f"• Forward mode: {mode_label}\n"
-        f"• Trigger words: {len(rule.get('trigger_words', []))} set\n\n"
+        f"• Trigger words: {len(rule.get('trigger_words', []))} set\n"
+        f"• Buttons: {'ON ✅' if rule.get('keep_buttons', True) else 'OFF'}\n\n"
         "Kya change karna hai?",
         reply_markup=buttons
     )
@@ -595,6 +600,22 @@ async def cb_redit(bot: Client, query: CallbackQuery):
         if rule_id in _rule_map:
             _rule_map[rule_id][field] = new_val
         await query.answer(f"{'ON' if new_val else 'OFF'} kar diya!", show_alert=False)
+        rule[field] = new_val
+        return await query.message.edit_reply_markup(_edit_rule_keyboard(owner_id, rule_id, rule))
+
+    # Toggle keep_buttons (default True, isliye pehli baar bhi flip karna hai)
+    if field == "keep_buttons":
+        new_val = not rule.get("keep_buttons", True)
+        await db.update_rule_field(owner_id, rule_id, field, new_val)
+        from auto_listener import _rule_map
+        if rule_id in _rule_map:
+            _rule_map[rule_id][field] = new_val
+        msg_txt = (
+            "🔘 Buttons: ON — button ke saath forward hoga (us post pe \"Forwarded from\" tag aayega)"
+            if new_val else
+            "🔘 Buttons: OFF — button hata ke normal forward hoga"
+        )
+        await query.answer(msg_txt, show_alert=False)
         rule[field] = new_val
         return await query.message.edit_reply_markup(_edit_rule_keyboard(owner_id, rule_id, rule))
 
