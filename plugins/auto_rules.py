@@ -9,6 +9,7 @@ Changes:
 """
 import uuid
 import re
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -16,6 +17,31 @@ from pyrogram.types import (
 from database import db
 from userbot import get_client
 from state_router import AUTO_STATE, EDIT_STATE, clear_all
+
+
+# ─────────────────────── Chat Label Helper ────────────────────────────────
+
+async def _resolve_chat_labels(client, chat_ids: list) -> list[str]:
+    """
+    Har chat_id ke liye readable label banao: "Title (@username)" ya
+    "Title (`id`)" agar username nahi hai. Fetch fail ho toh sirf ID
+    dikhado — taaki edit karte waqt pata chale kaunsa source/target set hai.
+    """
+    if not chat_ids:
+        return []
+    if not client:
+        return [f"`{cid}`" for cid in chat_ids]
+
+    async def _one(cid):
+        try:
+            chat = await client.get_chat(cid)
+            title = chat.title or chat.first_name or "Unknown"
+            uname = f"@{chat.username}" if chat.username else f"`{cid}`"
+            return f"{title} ({uname})"
+        except Exception:
+            return f"`{cid}`"
+
+    return list(await asyncio.gather(*[_one(c) for c in chat_ids]))
 
 
 @Client.on_message(filters.private & filters.command("auto"))
@@ -396,7 +422,7 @@ async def _save_rule(msg: Message, owner_id: int, state: dict):
         "specific_forward_mode": state.get("specific_forward_mode"),
         "trigger_words"        : state.get("trigger_words", []),
         "remove_words"         : state.get("remove_words", []),
-        "keep_buttons"         : state.get("keep_buttons", True),
+        "keep_buttons"         : state.get("keep_buttons", False),
     }
     await db.add_auto_rule(owner_id, rule)
     from auto_listener import register_rule
@@ -511,7 +537,7 @@ def _edit_rule_keyboard(owner_id: int, rule_id: str, rule: dict) -> InlineKeyboa
         None         : "None",
     }.get(mode, "None")
     rw_count = len(rule.get("remove_words", []))
-    kb       = "ON ✅" if rule.get("keep_buttons", True) else "OFF"
+    kb       = "ON ✅" if rule.get("keep_buttons", False) else "OFF"
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 Sources Change",   callback_data=f"redit#{owner_id}#{rule_id}#source")],
@@ -545,33 +571,44 @@ async def cb_edit_rule(bot: Client, query: CallbackQuery):
     if not rule:
         return await query.message.edit_text("❌ Rule nahi mila.")
 
+    client = await get_client(owner_id)
+
     source_ids = rule.get("source_ids") or ([rule["source_id"]] if rule.get("source_id") else [])
-    rmap       = rule.get("replace_map", {})
-    rmap_prev  = ", ".join(f"`{k}`→`{v}`" for k, v in list(rmap.items())[:3])
-    if len(rmap) > 3:
-        rmap_prev += f" (+{len(rmap)-3} more)"
+    target_ids = rule.get("targets", [])
+
+    await query.answer("⏳ Details load ho rahi hain...")
+    source_labels = await _resolve_chat_labels(client, source_ids)
+    target_labels = await _resolve_chat_labels(client, target_ids)
+    sources_str = "\n".join(f"    {i+1}. {lbl}" for i, lbl in enumerate(source_labels)) or "    None"
+    targets_str = "\n".join(f"    {i+1}. {lbl}" for i, lbl in enumerate(target_labels)) or "    None"
+
+    rmap = rule.get("replace_map", {})
+    rmap_str = "\n".join(f"    • `{k}` → `{v}`" for k, v in rmap.items()) if rmap else "    None"
+
     mode       = rule.get("specific_forward_mode")
     mode_label = {"forward": "Only Forward ✅", "not_forward": "Not Forward 🚫", None: "None"}.get(mode, "None")
-    rw         = rule.get("remove_words", [])
-    rw_prev    = ", ".join(f"`{w}`" for w in rw[:5])
-    if len(rw) > 5:
-        rw_prev += f" (+{len(rw)-5} more)"
+
+    rw = rule.get("remove_words", [])
+    rw_str = ", ".join(f"`{w}`" for w in rw) if rw else "None"
+
+    tw = rule.get("trigger_words", [])
+    tw_str = ", ".join(f"`{w}`" for w in tw) if tw else "None"
 
     buttons = _edit_rule_keyboard(owner_id, rule_id, rule)
     await query.message.edit_text(
         f"✏️ **Edit Rule** `{rule_id}`\n\n"
-        f"• Sources: {len(source_ids)} channel(s)\n"
-        f"• Targets: {len(rule['targets'])} channel(s)\n"
+        f"📥 **Sources** ({len(source_ids)}):\n{sources_str}\n\n"
+        f"📤 **Targets** ({len(target_ids)}):\n{targets_str}\n\n"
         f"• Affiliate: {rule.get('affiliate_bot') or 'None'}\n"
         f"• Hide links: {rule.get('hide_links', False)}\n"
         f"• Hide @users: {rule.get('hide_usernames', False)}\n"
         f"• Remove thumbnail: {rule.get('remove_thumbnail', False)}\n"
         f"• Bold text: {rule.get('bold_text', False)}\n"
-        f"• Replacements: {len(rmap)}" + (f" — {rmap_prev}" if rmap_prev else "") + "\n"
-        f"• Remove words: {len(rw)}" + (f" — {rw_prev}" if rw_prev else "") + "\n"
-        f"• Forward mode: {mode_label}\n"
-        f"• Trigger words: {len(rule.get('trigger_words', []))} set\n"
-        f"• Buttons: {'ON ✅' if rule.get('keep_buttons', True) else 'OFF'}\n\n"
+        f"• Buttons: {'ON ✅' if rule.get('keep_buttons', False) else 'OFF'}\n\n"
+        f"🔄 **Replacements** ({len(rmap)}):\n{rmap_str}\n\n"
+        f"🗑 **Remove words** ({len(rw)}): {rw_str}\n\n"
+        f"📌 Forward mode: {mode_label}\n"
+        f"⚡ **Trigger words** ({len(tw)}): {tw_str}\n\n"
         "Kya change karna hai?",
         reply_markup=buttons
     )
@@ -603,9 +640,9 @@ async def cb_redit(bot: Client, query: CallbackQuery):
         rule[field] = new_val
         return await query.message.edit_reply_markup(_edit_rule_keyboard(owner_id, rule_id, rule))
 
-    # Toggle keep_buttons (default True, isliye pehli baar bhi flip karna hai)
+    # Toggle keep_buttons (default OFF)
     if field == "keep_buttons":
-        new_val = not rule.get("keep_buttons", True)
+        new_val = not rule.get("keep_buttons", False)
         await db.update_rule_field(owner_id, rule_id, field, new_val)
         from auto_listener import _rule_map
         if rule_id in _rule_map:
