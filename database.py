@@ -117,6 +117,10 @@ class Database:
     #   remove_words,            ← NEW: list of words to delete from forwarded text
     #   specific_forward_mode,   ← "forward" | "not_forward" | None
     #   trigger_words,           ← list of words
+    #   keep_buttons,            ← NEW: bool — True = inline buttons ke saath
+    #                              forward (native forward, "Forwarded from" tag
+    #                              aayega us post pe). False = button strip karke
+    #                              normal (processed) forward.
     # }
 
     async def add_auto_rule(self, owner_id: int, rule: dict):
@@ -127,6 +131,7 @@ class Database:
         rule.setdefault("specific_forward_mode", None)
         rule.setdefault("trigger_words",         [])
         rule.setdefault("remove_words",          [])   # NEW
+        rule.setdefault("keep_buttons",          True)   # NEW: button preserve toggle
         # source_id → source_ids migration (backward compat)
         if "source_id" in rule and "source_ids" not in rule:
             rule["source_ids"] = [rule["source_id"]]
@@ -140,6 +145,7 @@ class Database:
             r.setdefault("specific_forward_mode", None)
             r.setdefault("trigger_words",         [])
             r.setdefault("remove_words",          [])   # NEW
+            r.setdefault("keep_buttons",          True)   # NEW: button preserve toggle
             # Backward compat: purane rules mein source_id tha
             if "source_ids" not in r and "source_id" in r:
                 r["source_ids"] = [r["source_id"]]
@@ -153,6 +159,7 @@ class Database:
             r.setdefault("specific_forward_mode", None)
             r.setdefault("trigger_words",         [])
             r.setdefault("remove_words",          [])   # NEW
+            r.setdefault("keep_buttons",          True)   # NEW: button preserve toggle
             if "source_ids" not in r and "source_id" in r:
                 r["source_ids"] = [r["source_id"]]
         return r
@@ -168,6 +175,7 @@ class Database:
             r.setdefault("specific_forward_mode", None)
             r.setdefault("trigger_words",         [])
             r.setdefault("remove_words",          [])   # NEW
+            r.setdefault("keep_buttons",          True)   # NEW: button preserve toggle
             if "source_ids" not in r and "source_id" in r:
                 r["source_ids"] = [r["source_id"]]
         return rules

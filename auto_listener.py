@@ -491,7 +491,10 @@ async def _flush_media_group(client: Client, buf_key: str, rule: dict):
 # ─────────────────────── Core Processing (single message) ────────────────
 
 def _needs_processing(rule: dict, message=None) -> bool:
-    rule_proc = bool(
+    # NOTE: button (reply_markup) preserve karne ka logic ab _forward_one
+    # mein alag se (native forward ke through) handle hota hai — isliye
+    # yahan uska hisab nahi rakhna.
+    return bool(
         rule.get("bold_text") or
         rule.get("hide_links") or
         rule.get("hide_usernames") or
@@ -499,9 +502,6 @@ def _needs_processing(rule: dict, message=None) -> bool:
         rule.get("remove_thumbnail") or
         rule.get("remove_words")
     )
-    # Agar message mein inline buttons hain toh bhi manually send karo taaki reply_markup preserve ho
-    has_markup = bool(message and message.reply_markup)
-    return rule_proc or has_markup
 
 
 async def _process_and_forward(client: Client, message: Message, rule: dict):
@@ -541,6 +541,7 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
 
     rule_id = rule.get("rule_id", "")
     is_only_forward_mode = rule.get("specific_forward_mode") == "forward"
+    keep_buttons = rule.get("keep_buttons", True)
 
     for target in targets:
         sent_msg = await _forward_one(
@@ -549,6 +550,7 @@ async def _process_and_forward(client: Client, message: Message, rule: dict):
             remove_thumbnail=remove_thumbnail,
             bold_text=bold_text,
             needs_processing=_needs_processing(rule, message),
+            keep_buttons=keep_buttons,
         )
         if sent_msg and is_only_forward_mode and rule_id:
             _register_edit_track(
@@ -571,23 +573,56 @@ async def _forward_one(
     remove_thumbnail: bool = False,
     bold_text: bool = False,
     needs_processing: bool = False,
+    keep_buttons: bool = True,
 ) -> Message | None:
     has_text   = bool(new_text and new_text.strip())
     parse_mode = enums.ParseMode.HTML if bold_text else enums.ParseMode.DISABLED
-    reply_markup = message.reply_markup if message.reply_markup else None
+    has_button = bool(message.reply_markup)
+
+    # ── BUTTON FIX ──────────────────────────────────────────────────────
+    # Telegram rule: reply_markup (inline button) sirf BOT accounts attach
+    # kar sakte hain. Yeh bot ek userbot (normal Telegram account) use
+    # karta hai, isliye copy_message/send_* mein reply_markup pass karne
+    # se bhi Telegram use silently drop kar deta tha — button forward hote
+    # waqt hat jata tha.
+    #
+    # Fix: agar message mein button hai aur rule mein "keep_buttons" ON
+    # hai, toh native forward (client.forward_messages) use karo — yeh
+    # original message ko as-is forward karta hai (button samet), kyunki
+    # yeh "naya message + naya markup" nahi balki wahi purana message hai.
+    # Side-effect: sirf button-wale posts pe target channel mein
+    # "Forwarded from" tag dikhega.
+    #
+    # Agar "keep_buttons" OFF hai — button strip karke neeche wale normal
+    # (processed) flow se bhejo.
+    if has_button and keep_buttons:
+        try:
+            fwd = await client.forward_messages(
+                chat_id=target,
+                from_chat_id=message.chat.id,
+                message_ids=message.id,
+            )
+            return fwd[0] if isinstance(fwd, list) else fwd
+        except ChatForwardsRestricted:
+            logger.info(f"Button-forward blocked (source restricted) — button strip fallback for target {target}")
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+            return await _forward_one(client, message, target, new_text,
+                                      remove_thumbnail, bold_text,
+                                      needs_processing, keep_buttons)
+        except Exception as e:
+            logger.warning(f"Button-forward failed ({e}) — button strip fallback for target {target}")
 
     try:
         # Special case: remove_thumbnail — sirf text bhejo
         if remove_thumbnail:
             if has_text:
-                return await client.send_message(target, new_text, parse_mode=parse_mode,
-                                                 reply_markup=reply_markup)
+                return await client.send_message(target, new_text, parse_mode=parse_mode)
             return None
 
         # ── STEP 1: Hamesha copy_message try karo ──
-        # Yeh sabse best method hai — bold, links, quotes, buttons — sab exactly copy hota hai
-        # needs_processing ho ya na ho, copy_message pehle try karo
-        if not needs_processing or message.reply_markup:
+        # Yeh sabse best method hai — bold, links, quotes — sab exactly copy hota hai
+        if not needs_processing:
             try:
                 return await client.copy_message(
                     chat_id=target,
@@ -603,15 +638,13 @@ async def _forward_one(
         # Text-only message
         if not _has_media(message):
             if has_text:
-                if not needs_processing and (message.entities or reply_markup):
-                    # Entities + buttons dono preserve karo
+                if not needs_processing and message.entities:
+                    # Entities preserve karo
                     return await client.send_message(
                         target, message.text or new_text,
                         entities=message.entities or None,
-                        reply_markup=reply_markup,
                     )
-                return await client.send_message(target, new_text, parse_mode=parse_mode,
-                                                 reply_markup=reply_markup)
+                return await client.send_message(target, new_text, parse_mode=parse_mode)
             return None
 
         # Media message — needs_processing ke saath manual send
@@ -627,39 +660,33 @@ async def _forward_one(
         if message.photo:
             return await client.send_photo(target, message.photo.file_id,
                                            caption=caption, parse_mode=cap_mode,
-                                           caption_entities=cap_entities,
-                                           reply_markup=reply_markup)
+                                           caption_entities=cap_entities)
         elif message.video:
             return await client.send_video(target, message.video.file_id,
                                            caption=caption, parse_mode=cap_mode,
                                            caption_entities=cap_entities,
-                                           supports_streaming=True, reply_markup=reply_markup)
+                                           supports_streaming=True)
         elif message.audio:
             return await client.send_audio(target, message.audio.file_id,
                                            caption=caption, parse_mode=cap_mode,
-                                           caption_entities=cap_entities,
-                                           reply_markup=reply_markup)
+                                           caption_entities=cap_entities)
         elif message.document:
             return await client.send_document(target, message.document.file_id,
                                               caption=caption, parse_mode=cap_mode,
-                                              caption_entities=cap_entities,
-                                              reply_markup=reply_markup)
+                                              caption_entities=cap_entities)
         elif message.animation:
             return await client.send_animation(target, message.animation.file_id,
                                                caption=caption, parse_mode=cap_mode,
-                                               caption_entities=cap_entities,
-                                               reply_markup=reply_markup)
+                                               caption_entities=cap_entities)
         elif message.voice:
             return await client.send_voice(target, message.voice.file_id,
                                            caption=caption, parse_mode=cap_mode,
-                                           caption_entities=cap_entities,
-                                           reply_markup=reply_markup)
+                                           caption_entities=cap_entities)
         else:
             return await _send_restricted_media(
                 client, message, target,
                 caption=caption,
                 parse_mode=cap_mode,
-                reply_markup=reply_markup,
             )
 
     except PeerIdInvalid:
@@ -671,7 +698,6 @@ async def _forward_one(
             client, message, target,
             caption=new_text if has_text else None,
             parse_mode=parse_mode,
-            reply_markup=reply_markup,
         )
     except FloodWait as e:
         logger.warning(f"FloodWait {e.value}s for target {target}")
@@ -680,7 +706,8 @@ async def _forward_one(
                                   new_text=new_text,
                                   remove_thumbnail=remove_thumbnail,
                                   bold_text=bold_text,
-                                  needs_processing=needs_processing)
+                                  needs_processing=needs_processing,
+                                  keep_buttons=keep_buttons)
     except Exception as e:
         logger.error(f"Forward to {target} failed: {e}")
     return None
